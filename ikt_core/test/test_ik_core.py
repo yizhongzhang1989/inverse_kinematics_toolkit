@@ -7,8 +7,8 @@ offline — no ROS, no xacro.
 
 import numpy as np
 
-from ikt_inverse_kinematics import ik_core
-from ikt_inverse_kinematics.tasks import Task, Reason
+from ikt_core import ik_core
+from ikt_core.tasks import Task, Reason
 
 _RIGHT = [f"right_arm_joint{i}" for i in range(1, 7)]
 _LEFT = [f"left_arm_joint{i}" for i in range(1, 7)]

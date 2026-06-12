@@ -50,7 +50,7 @@ try:
 except Exception:  # pragma: no cover
     get_package_share_directory = None  # type: ignore
 
-from .robot_model import RobotModel
+from ikt_core.robot_model import RobotModel
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 

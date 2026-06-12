@@ -8,9 +8,9 @@ dual_arm URDF.
 
 import numpy as np
 
-from ikt_inverse_kinematics import ik_core
-from ikt_inverse_kinematics.tasks import Task
-from ikt_inverse_kinematics.collision import (
+from ikt_core import ik_core
+from ikt_core.tasks import Task
+from ikt_core.collision import (
     Capsule, make_self_collision_extra_task, _closest_points_segments,
 )
 

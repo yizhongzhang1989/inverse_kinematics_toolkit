@@ -47,11 +47,11 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
-from . import ik_core
-from .robot_model import RobotModel
-from .tasks import Task, Reason
-from .arm_angle import SRSChain, make_arm_angle_extra_task, compute_all_psi
-from .relative import make_relative_extra_task
+from ikt_core import ik_core
+from ikt_core.robot_model import RobotModel
+from ikt_core.tasks import Task, Reason
+from ikt_core.arm_angle import SRSChain, make_arm_angle_extra_task, compute_all_psi
+from ikt_core.relative import make_relative_extra_task
 
 try:
     import tf2_ros
@@ -86,6 +86,12 @@ class IKNode(Node):
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("base_frame", "")
+        # URDF source (optional): provide the model directly instead of reading
+        # the /robot_description topic. ``urdf_file`` is a path to a .urdf or
+        # .xacro (xacro auto-run); ``robot_description`` is a raw URDF/XML
+        # string. If either is set it WINS and the topic is not used.
+        self.declare_parameter("urdf_file", "")
+        self.declare_parameter("robot_description", "")
         self.declare_parameter("max_iters", 200)
         self.declare_parameter("tol_pos", 1e-3)
         self.declare_parameter("tol_ori", 3.5e-3)
@@ -99,18 +105,23 @@ class IKNode(Node):
         self._desc_topic = self.get_parameter("robot_description_topic").value
         self._js_topic = self.get_parameter("joint_states_topic").value
         self._base_frame = self.get_parameter("base_frame").value or ""
+        self._urdf_file = str(self.get_parameter("urdf_file").value or "")
+        self._urdf_string = str(self.get_parameter("robot_description").value or "")
 
         self._lock = threading.Lock()
         self._model: Optional[RobotModel] = None
         self._urdf: str = ""
+        self._urdf_locked = False          # True when a static URDF source wins
         self._vframe_key = ()              # cache key for the augmented model
         self._joint_pos: Dict[str, float] = {}
         self._srs_chains: Dict[str, SRSChain] = self._load_srs_chains()
         self._last_solution = None
 
         # ---- pubs / subs ------------------------------------------------
-        self.create_subscription(String, self._desc_topic,
-                                 self._on_urdf, _latched_qos())
+        # Only subscribe to /robot_description when no static URDF was provided.
+        if not (self._urdf_file or self._urdf_string):
+            self.create_subscription(String, self._desc_topic,
+                                     self._on_urdf, _latched_qos())
         self.create_subscription(JointState, self._js_topic,
                                  self._on_js, 50)
         self.create_subscription(String, "~/solve_request",
@@ -134,10 +145,38 @@ class IKNode(Node):
         rate = float(self.get_parameter("status_rate_hz").value)
         self.create_timer(1.0 / max(0.5, rate), self._publish_status)
 
-        self.get_logger().info(
-            "ikt_inverse_kinematics ik_node started (advisory only — NEVER "
-            "commands the robot). Waiting for %s and %s."
-            % (self._desc_topic, self._js_topic))
+        # If a static URDF source was given, build the model now (it wins over
+        # the topic, which we did not subscribe to).
+        self._load_static_urdf()
+
+        if self._urdf_locked:
+            self.get_logger().info(
+                "ikt_inverse_kinematics ik_node started (advisory only — NEVER "
+                "commands the robot). Using a static URDF (%s)."
+                % (self._urdf_file or "robot_description param"))
+        else:
+            self.get_logger().info(
+                "ikt_inverse_kinematics ik_node started (advisory only — NEVER "
+                "commands the robot). Waiting for %s and %s."
+                % (self._desc_topic, self._js_topic))
+
+    def _load_static_urdf(self) -> None:
+        """Build the model from ``urdf_file`` / ``robot_description`` if given."""
+        xml = ""
+        try:
+            if self._urdf_file:
+                from ikt_core.urdf_utils import read_urdf
+                xml = read_urdf(self._urdf_file)
+            elif self._urdf_string:
+                xml = self._urdf_string
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                "Failed to read static URDF source: %r" % exc)
+            return
+        if not xml:
+            return
+        self._set_urdf(xml, source="static URDF")
+        self._urdf_locked = True
 
     # ------------------------------------------------------------------ #
     # Param helpers
@@ -185,18 +224,27 @@ class IKNode(Node):
     # Subscriptions
     # ------------------------------------------------------------------ #
     def _on_urdf(self, msg: String) -> None:
+        if self._urdf_locked:
+            return
+        if msg.data:
+            self._set_urdf(msg.data, source="/robot_description")
+
+    def _set_urdf(self, xml: str, source: str = "") -> None:
+        """Build (or rebuild) the kinematic model from a URDF string."""
         with self._lock:
-            if msg.data and msg.data != self._urdf:
-                self._urdf = msg.data
-                self._vframe_key = ()
-                try:
-                    self._model = RobotModel(msg.data)
-                    self.get_logger().info(
-                        "Built kinematic model: %d DOF, %d frames."
-                        % (self._model.nq, len(self._model.frame_names())))
-                except Exception as exc:  # noqa: BLE001
-                    self._model = None
-                    self.get_logger().error("Failed to build model: %r" % exc)
+            if not xml or xml == self._urdf:
+                return
+            self._urdf = xml
+            self._vframe_key = ()
+            try:
+                self._model = RobotModel(xml)
+                self.get_logger().info(
+                    "Built kinematic model: %d DOF, %d frames%s."
+                    % (self._model.nq, len(self._model.frame_names()),
+                       f" (from {source})" if source else ""))
+            except Exception as exc:  # noqa: BLE001
+                self._model = None
+                self.get_logger().error("Failed to build model: %r" % exc)
 
     def _on_js(self, msg: JointState) -> None:
         with self._lock:
@@ -347,7 +395,7 @@ class IKNode(Node):
         # optional soft self-collision penalty (E2), request- or param-enabled
         sc = req.get("self_collision")
         if sc and sc.get("capsules"):
-            from .collision import Capsule, make_self_collision_extra_task
+            from ikt_core.collision import Capsule, make_self_collision_extra_task
             caps = [Capsule(c["frame_a"], c["frame_b"], float(c.get("radius", 0.05)))
                     for c in sc["capsules"]]
             extras.append(make_self_collision_extra_task(

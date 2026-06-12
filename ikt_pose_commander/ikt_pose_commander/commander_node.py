@@ -64,9 +64,9 @@ except ImportError:  # pragma: no cover
 
 # In-process IK (the advisory solver). Pure-Python core: no topic round-trip.
 try:
-    from ikt_inverse_kinematics.robot_model import RobotModel
-    from ikt_inverse_kinematics import ik_core
-    from ikt_inverse_kinematics.tasks import Task
+    from ikt_core.robot_model import RobotModel
+    from ikt_core import ik_core
+    from ikt_core.tasks import Task
     _IK_IMPORT_ERROR: Optional[str] = None
 except Exception as _exc:  # noqa: BLE001  pragma: no cover
     RobotModel = None  # type: ignore
@@ -152,7 +152,7 @@ class PoseCommander(Node):
             raise ValueError("command_mode must be 'jtc' or 'fpc'")
         if _IK_IMPORT_ERROR is not None:
             self.get_logger().error(
-                "ikt_inverse_kinematics import failed: %s — the commander "
+                "ikt_core import failed: %s — the commander "
                 "cannot solve IK. Is the package built/sourced?"
                 % _IK_IMPORT_ERROR)
 

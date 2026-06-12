@@ -41,6 +41,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("params_file", default_value=params),
         DeclareLaunchArgument("base_frame", default_value=str(d["base_frame"])),
         DeclareLaunchArgument("port", default_value=str(d["dashboard_port"])),
+        DeclareLaunchArgument(
+            "urdf_file", default_value="",
+            description="Path to a .urdf/.xacro to use instead of the "
+                        "/robot_description topic (empty = use the topic)."),
         LogInfo(msg=f"[ikt_inverse_kinematics] config: {source}"),
         Node(
             package="ikt_inverse_kinematics",
@@ -49,7 +53,8 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[
                 LaunchConfiguration("params_file"),
-                {"base_frame": LaunchConfiguration("base_frame")},
+                {"base_frame": LaunchConfiguration("base_frame"),
+                 "urdf_file": LaunchConfiguration("urdf_file")},
             ],
         ),
         Node(

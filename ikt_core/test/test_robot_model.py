@@ -6,7 +6,7 @@ joint<->index mapping, and virtual tool-frame augmentation.
 
 import numpy as np
 
-from ikt_inverse_kinematics.robot_model import (
+from ikt_core.robot_model import (
     RobotModel, R_from_quat_wxyz, quat_wxyz_from_R,
 )
 from conftest import load_bundled

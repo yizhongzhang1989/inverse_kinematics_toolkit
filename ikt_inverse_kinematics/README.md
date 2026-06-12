@@ -1,21 +1,38 @@
 # ikt_inverse_kinematics
 
-A **robot-agnostic, advisory-only inverse-kinematics service** for the
-`cartesian_controllers_toolkit`. Given a URDF (read live from
-`/robot_description`) it solves, for one or more chosen links, the joint angles
-that place those links at requested target poses — subject to joint limits,
-singularity robustness, a soft rest-posture bias, and **per-DOF task stiffness**.
+The **ROS 2 layer** over the [`ikt_core`](../ikt_core) inverse-kinematics
+solver. `ik_node` reads a URDF from a file/string parameter or from
+`/robot_description`, builds the model with `ikt_core`, and exposes a JSON (and
+optional typed) solve API; an optional 3D web dashboard and an RViz marker
+bridge round it out. Given a URDF it solves, for one or more chosen links, the
+joint angles that place those links at requested target poses — subject to joint
+limits, singularity robustness, a soft rest-posture bias, and **per-DOF task
+stiffness**.
 
 > **The solver never commands the robot.** It publishes IK *results* (a
 > `JointState` solution + JSON diagnostics). A separate consumer decides whether
 > and how to actuate. `~/solution` is explicitly **not** a controller command.
+
+## Just want a Python library? Use `ikt_core`
+
+The reusable, ROS-free solver — the `IK` class, `solve_ik`, the `ikt` CLI and the
+bundled sample URDFs — lives in [`ikt_core`](../ikt_core) and needs only
+`numpy` + `pinocchio`:
+
+```python
+from ikt_core import IK, solve_ik, assets
+ik = IK.from_urdf_file("arm.urdf")
+sol = ik.solve("tool0", [0.4, -0.2, 0.5])
+```
+
+This package adds the ROS nodes on top of that core.
 
 ## Capabilities
 
 | # | Feature |
 |---|---------|
 | R1 | Pose → joints for **any frame** (intermediate links included) and **multiple tips** (dual-arm), solved simultaneously |
-| R2 | **Virtual tool frames** — attach a 6-DOF offset to a link and solve on it (via `ikt_common.urdf_loader.augment_urdf`) |
+| R2 | **Virtual tool frames** — attach a 6-DOF offset to a link and solve on it (via `ikt_core.urdf_utils.augment_urdf`) |
 | R3 | **Constraints** — hard joint limits (box), singularity damping, soft "prefer rest posture" |
 | R4 | **Per-DOF stiffness** — weight each Cartesian DOF; low orientation weight ⇒ position dominates (avoids unwanted rotations) |
 | R6 | **Arm-angle ψ** — report and *control* the 7-DOF elbow-swivel redundancy (S-R-S), the bridge to the FZI null-space fix |
@@ -26,17 +43,21 @@ singularity robustness, a soft rest-posture bias, and **per-DOF task stiffness**
 
 ## Architecture
 
+The ROS-free solver core (`ik_core`, `robot_model`, `tasks`, `arm_angle`,
+`relative`, `collision`, `urdf_utils`, `assets`, the `IK` API and the `ikt` CLI)
+lives in the [`ikt_core`](../ikt_core) package. This package contains only the
+ROS nodes:
+
 ```
-ik_core.py     pure-Python weighted LM-DLS solver (no rclpy) — unit-tested offline
-robot_model.py URDF string -> Pinocchio model (frames / Jacobians / limits)
-tasks.py       Task / RelativeTask / ArmAngleTask / VirtualFrame / Solution
-arm_angle.py   S-R-S arm-angle psi compute/report + desired-psi task (R6)
-relative.py    dual-arm relative-pose task (R9)
-ik_node.py     headless ROS node: reads URDF + joint states, JSON solve API (advisory)
+ik_node.py     headless ROS node: URDF from file/string/topic; builds the model
+               via ikt_core, exposes the JSON + typed solve API (advisory)
 dashboard_node.py  optional 3D web UI (http.server + Three.js) — renders the
                robot from /robot_description meshes, ghosts the IK solution,
                and drives every solve function; pure client of the ROS API
+marker_node.py optional RViz interactive-marker bridge
 static/        index.html + app.js (Three.js viewer) + dashboard.css + vendor/
+launch/        ik / dashboard / ik_with_dashboard launch files
+config/        ik_defaults.yaml (solver tuning)
 ```
 
 The math is one **weighted, damped, box-constrained least-squares** problem
@@ -46,22 +67,27 @@ applied in the **task null space** so it never degrades the Cartesian task.
 
 ## Dependencies
 
-- **Pinocchio** (`python3-pinocchio`) — kinematics backend (required).
-- `numpy`, `rclpy`, `sensor_msgs`, `geometry_msgs`, `std_msgs`, `tf2_ros`,
-  `ikt_common`.
+- [`ikt_core`](../ikt_core) — the solver core (and, transitively, **Pinocchio**
+  + `numpy`). Pinocchio: `apt install python3-pinocchio` / `ros-<distro>-pinocchio`,
+  or `pip install pin`.
+- ROS: `rclpy`, `sensor_msgs`, `geometry_msgs`, `std_msgs`, `tf2_ros`,
+  `tf2_geometry_msgs`, `ikt_interfaces` (typed service), and `ikt_common`
+  (launch-time centralized config).
 
 ## Build
 
 ```bash
-colcon build --symlink-install --packages-select ikt_inverse_kinematics
+colcon build --symlink-install --packages-select ikt_core ikt_inverse_kinematics
 source install/setup.bash
 ```
 
 ## Run (headless solver)
 
 ```bash
-# after a robot (or mock) bringup is publishing /robot_description + /joint_states
+# URDF from the live topic (after a bringup publishes /robot_description):
 ros2 launch ikt_inverse_kinematics ik.launch.py
+# OR provide a URDF/xacro file directly (no /robot_description needed):
+ros2 launch ikt_inverse_kinematics ik.launch.py urdf_file:=/path/to/arm.urdf
 # with the 3D web dashboard (http://localhost:8160):
 ros2 launch ikt_inverse_kinematics ik_with_dashboard.launch.py
 ```

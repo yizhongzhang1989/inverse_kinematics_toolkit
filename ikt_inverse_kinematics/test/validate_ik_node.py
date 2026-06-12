@@ -23,7 +23,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
-from ikt_inverse_kinematics.robot_model import RobotModel
+from ikt_core.robot_model import RobotModel
 
 
 def latched():

@@ -10,12 +10,12 @@
 import numpy as np
 import pytest
 
-from ikt_inverse_kinematics import ik_core
-from ikt_inverse_kinematics.tasks import Task
-from ikt_inverse_kinematics.arm_angle import (
+from ikt_core import ik_core
+from ikt_core.tasks import Task
+from ikt_core.arm_angle import (
     SRSChain, compute_psi, psi_jacobian, make_arm_angle_extra_task,
 )
-from ikt_inverse_kinematics.relative import make_relative_extra_task
+from ikt_core.relative import make_relative_extra_task
 
 # srs_7dof: shoulder/elbow/wrist marker frames + a single 7-DOF chain.
 _SRS = [f"joint{i}" for i in range(1, 8)]

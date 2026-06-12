@@ -33,13 +33,12 @@ setup(
     zip_safe=True,
     maintainer='yizhongzhang',
     maintainer_email='yizhongzhang1989@gmail.com',
-    description='Robot-agnostic, advisory-only inverse-kinematics service '
-                '(Pinocchio backend): multi-tip / arbitrary-link / tool-frame '
-                'pose solving with per-DOF stiffness, joint limits, singularity '
-                'robustness, rest-posture bias, arm-angle redundancy control, '
-                'reachability verdict, TF-framed targets and a dual-arm '
-                'relative-pose constraint. Headless solver + optional web '
-                'dashboard + optional RViz marker + CLI.',
+    description='ROS 2 layer over the ikt_core inverse-kinematics solver: a '
+                'headless advisory solver node (URDF from file/string/topic, '
+                'JSON + typed API), an optional 3D web dashboard, and an RViz '
+                'interactive-marker bridge. The solver never commands the robot '
+                '(it publishes IK results only). Core math + the Python library '
+                'API live in the ikt_core package.',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
@@ -47,7 +46,6 @@ setup(
             'ik_node = ikt_inverse_kinematics.ik_node:main',
             'dashboard_node = ikt_inverse_kinematics.dashboard_node:main',
             'marker_node = ikt_inverse_kinematics.marker_node:main',
-            'ikt = ikt_inverse_kinematics.cli:main',
         ],
     },
 )

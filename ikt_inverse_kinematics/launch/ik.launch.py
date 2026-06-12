@@ -67,6 +67,10 @@ def generate_launch_description() -> LaunchDescription:
             default_value=str(d["robot_description_topic"])),
         DeclareLaunchArgument(
             "joint_states_topic", default_value=str(d["joint_states_topic"])),
+        DeclareLaunchArgument(
+            "urdf_file", default_value="",
+            description="Path to a .urdf/.xacro to use instead of the "
+                        "/robot_description topic (empty = use the topic)."),
         LogInfo(msg=f"[ikt_inverse_kinematics] config: {source}"),
         Node(
             package="ikt_inverse_kinematics",
@@ -81,6 +85,7 @@ def generate_launch_description() -> LaunchDescription:
                         LaunchConfiguration("robot_description_topic"),
                     "joint_states_topic":
                         LaunchConfiguration("joint_states_topic"),
+                    "urdf_file": LaunchConfiguration("urdf_file"),
                 },
             ],
         ),

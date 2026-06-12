@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<!-- arm_6dof: a 6-DOF anthropomorphic arm with a spherical wrist (joints 4-5-6
+     intersecting), capable of full 6-DOF pose IK. Tip frame: tool0.
+     Primitive-free (no meshes / no package:// refs), license-clean. -->
+<robot name="arm_6dof">
+  <link name="base_link"/>
+
+  <!-- J1: base yaw -->
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link1"/>
+
+  <!-- J2: shoulder pitch -->
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.0" upper="2.0" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link2"/>
+
+  <!-- J3: elbow pitch (upper-arm length 0.35) -->
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0 0 0.35" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.6" upper="2.6" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link3"/>
+
+  <!-- J4: wrist roll (forearm length 0.30) -->
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0 0 0.30" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="50" velocity="3.5"/>
+  </joint>
+  <link name="link4"/>
+
+  <!-- J5: wrist pitch (intersects J4/J6 at the wrist centre) -->
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.0" upper="2.0" effort="50" velocity="3.5"/>
+  </joint>
+  <link name="link5"/>
+
+  <!-- J6: wrist roll (flange) -->
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="50" velocity="3.5"/>
+  </joint>
+  <link name="link6"/>
+
+  <!-- tool flange offset -->
+  <joint name="tool0_fixed" type="fixed">
+    <parent link="link6"/>
+    <child link="tool0"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+  </joint>
+  <link name="tool0"/>
+</robot>

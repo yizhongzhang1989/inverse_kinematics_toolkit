@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Package metadata, entry points, package_data and data_files live in setup.py
+# (kept dynamic so the same package builds under both `pip install .` and
+# colcon/ament_python). This file only declares the modern build backend so a
+# plain `pip install .` works without a deprecation warning.
+#
+# Pinocchio is the kinematics backend and is usually system-provided
+# (apt: python3-pinocchio / ros-<distro>-pinocchio, or conda). For a pure pip
+# environment install the extra:
+#
+#     pip install ".[pinocchio]"

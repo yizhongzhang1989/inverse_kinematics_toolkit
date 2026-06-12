@@ -4,18 +4,20 @@
   <name>ikt_inverse_kinematics</name>
   <version>0.1.0</version>
   <description>
-    Robot-agnostic inverse-kinematics service for the cartesian_controllers
-    toolkit. Given a URDF (read live from /robot_description) it solves, for one
-    or more chosen links (including intermediate links and virtual tool frames,
-    and multiple tips for a dual-arm robot), the joint angles that place those
-    links at requested target poses -- subject to joint limits, singularity
-    robustness, a soft rest-posture bias, and per-DOF task stiffness. It also
-    reports/controls the 7-DOF arm-angle (null-space) redundancy, a reachability
-    verdict with closest-reachable pose, accepts TF-framed targets, and supports
-    a dual-arm relative-pose constraint. The solver is ADVISORY ONLY: it
-    publishes IK results (joint-angle solutions + diagnostics); it never commands
-    the robot. A headless solver node, an optional web dashboard, an optional
-    RViz interactive-marker bridge, and a CLI are provided.
+    ROS 2 layer over the ikt_core inverse-kinematics solver. ik_node reads a
+    URDF from a file/string parameter or from /robot_description, builds the
+    model with ikt_core, and solves -- for one or more chosen links (including
+    intermediate links and virtual tool frames, and multiple tips for a dual-arm
+    robot) -- the joint angles that place those links at requested target poses,
+    subject to joint limits, singularity robustness, a soft rest-posture bias,
+    and per-DOF task stiffness. It also reports/controls the 7-DOF arm-angle
+    (null-space) redundancy, a reachability verdict with closest-reachable pose,
+    accepts TF-framed targets, and supports a dual-arm relative-pose constraint.
+    The solver is ADVISORY ONLY: it publishes IK results (joint-angle solutions
+    + diagnostics); it never commands the robot. A headless solver node, an
+    optional 3D web dashboard and an optional RViz interactive-marker bridge are
+    provided. The ROS-free core, the Python library (IK class + solve_ik) and
+    the ikt CLI live in the ikt_core package.
   </description>
 
   <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
@@ -31,6 +33,7 @@
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>ros2launch</exec_depend>
+  <exec_depend>ikt_core</exec_depend>
   <exec_depend>ikt_common</exec_depend>
   <exec_depend>ikt_interfaces</exec_depend>
 

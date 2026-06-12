@@ -37,7 +37,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from ikt_inverse_kinematics.robot_model import RobotModel
+from ikt_core.robot_model import RobotModel
 
 
 def _latched():
