@@ -57,9 +57,20 @@ async function poll() {
       o.value = l; o.textContent = l; sel.appendChild(o);
     }
     sel.dataset.count = String(links.length);
-    // preselect the currently controlled frame if any
-    if (s.controlled_frame) sel.value = s.controlled_frame;
-    else if (cur) sel.value = cur;
+    // preselect the currently controlled frame if any; otherwise pick a
+    // sensible robot-agnostic default — a gripper tip (prefer *Link7, then
+    // common end-effector names), never the root "world"/"base_link" which
+    // have no movable joints and make Configure fail.
+    if (s.controlled_frame) {
+      sel.value = s.controlled_frame;
+    } else if (cur && links.includes(cur)) {
+      sel.value = cur;
+    } else {
+      const tip = links.find((l) => /Link7$/.test(l))
+        || links.find((l) => /(tool|tcp|_ee$|hand|gripper|flange)/i.test(l))
+        || links[links.length - 1];
+      if (tip) sel.value = tip;
+    }
   }
 
   pill($("configured"), !!s.configured, "configured", "not configured");
