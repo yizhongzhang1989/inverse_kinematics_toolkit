@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ikt_inverse_kinematics</name>
+  <version>0.1.0</version>
+  <description>
+    Robot-agnostic inverse-kinematics service for the cartesian_controllers
+    toolkit. Given a URDF (read live from /robot_description) it solves, for one
+    or more chosen links (including intermediate links and virtual tool frames,
+    and multiple tips for a dual-arm robot), the joint angles that place those
+    links at requested target poses -- subject to joint limits, singularity
+    robustness, a soft rest-posture bias, and per-DOF task stiffness. It also
+    reports/controls the 7-DOF arm-angle (null-space) redundancy, a reachability
+    verdict with closest-reachable pose, accepts TF-framed targets, and supports
+    a dual-arm relative-pose constraint. The solver is ADVISORY ONLY: it
+    publishes IK results (joint-angle solutions + diagnostics); it never commands
+    the robot. A headless solver node, an optional web dashboard, an optional
+    RViz interactive-marker bridge, and a CLI are provided.
+  </description>
+
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>ikt_common</exec_depend>
+  <exec_depend>ikt_interfaces</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

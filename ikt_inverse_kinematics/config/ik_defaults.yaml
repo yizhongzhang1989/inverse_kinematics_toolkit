@@ -1,0 +1,46 @@
+# ikt_inverse_kinematics — default solver configuration.
+#
+# Loaded by ik_node (and reused by the CLI). Every value here is a parameter
+# default; override per-robot via your bringup's config or launch args. The
+# solver is advisory-only and never commands the robot.
+#
+# NOTE: ROS 2 parameter YAML requires flat (dotted) keys under ros__parameters
+# and does not accept empty maps; nested groups (srs_chains.<arm>.<field>) are
+# therefore written in dotted form and read defensively by ik_node.
+
+/**:
+  ros__parameters:
+    # ---- topics / frames ------------------------------------------------
+    robot_description_topic: "/robot_description"
+    joint_states_topic: "/joint_states"
+    base_frame: ""          # "" = use the URDF root link as the solve frame
+
+    # ---- solver tolerances / iteration ---------------------------------
+    max_iters: 200
+    tol_pos: 0.001          # metres  (1 mm)
+    tol_ori: 0.0035         # rad     (~0.2 deg)
+    damping: 0.01           # initial Levenberg-Marquardt lambda (mu)
+
+    # ---- default task weighting (per-DOF stiffness) --------------------
+    # diag(Wt) for a 6-DOF pose task: [x y z rx ry rz]. Relative weights.
+    default_task_stiffness: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+    # ---- redundancy resolution -----------------------------------------
+    joint_centering_weight: 0.01    # scalar k for the soft "prefer rest" term
+
+    # ---- arm-angle (R6) -------------------------------------------------
+    # Per-arm S-R-S chains for arm-angle psi (shoulder/elbow/wrist/base/tip
+    # frame names). ROBOT-INDEPENDENT: empty by default — the node solves any
+    # robot's URDF online without this. Declare chains ONLY if you want the
+    # arm-angle redundancy knob for a specific S-R-S arm, e.g. uncomment and
+    # set the frame names for your robot:
+    #   srs_chain_names: ["right_arm"]
+    #   srs_chains.right_arm.shoulder: "<your_shoulder_link>"
+    #   srs_chains.right_arm.elbow:    "<your_elbow_link>"
+    #   srs_chains.right_arm.wrist:    "<your_wrist_link>"
+    # (left empty / omitted -> the node's typed default [] is used; an empty
+    # list in YAML has no inferrable type so we do NOT set it here.)
+    arm_angle_stiffness: 0.5
+
+    # ---- status publish rate -------------------------------------------
+    status_rate_hz: 5.0

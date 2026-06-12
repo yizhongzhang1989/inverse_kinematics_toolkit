@@ -1,0 +1,12 @@
+# Solve inverse kinematics for one or more Cartesian tasks. Advisory only:
+# returns a joint-space solution + diagnostics; never commands the robot.
+
+# --- request ---
+IKTask[] tasks                       # one or more simultaneous tasks (multi-tip)
+string[] active_joints               # joints allowed to move ([] = all)
+float64[] seed                       # optional seed configuration ([] = current)
+---
+# --- response ---
+bool ok                              # request well-formed and a solve ran
+string message                       # error detail when ok == false
+IKResult result

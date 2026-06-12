@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# colcon build artifacts (toolkit packages should never be built in-place;
+# build them from the consuming workspace's build/install/log dirs)
+build/
+install/
+log/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

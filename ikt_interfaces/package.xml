@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ikt_interfaces</name>
+  <version>0.1.0</version>
+  <description>
+    Typed ROS 2 interfaces for ikt_inverse_kinematics: a SolveIK service and the
+    IKTask / IKResult messages, so C++ and other typed consumers can call the
+    advisory IK solver without the JSON-string API. The solver itself remains
+    advisory only (the service returns an IK solution + diagnostics; it never
+    commands the robot).
+  </description>
+
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

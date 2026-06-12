@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ikt_pose_commander</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <header>
+    <h1>ikt_pose_commander</h1>
+    <span id="conn" class="pill pill-bad">connecting…</span>
+  </header>
+
+  <main>
+    <!-- Configure (robot-independent: pick the link from the live URDF) -->
+    <section class="card">
+      <h2>Configure <span class="warn">(pick the link to control)</span></h2>
+      <div class="row">
+        <label>controlled link
+          <select id="link-select"><option value="">— loading from URDF —</option></select>
+        </label>
+        <label>mode
+          <select id="mode-select"><option value="jtc">jtc (safe)</option><option value="fpc">fpc (stream)</option></select>
+        </label>
+        <button id="btn-configure" class="btn btn-go">Configure</button>
+      </div>
+      <div class="grid">
+        <div class="stat"><span class="k">configured</span><span id="configured" class="v pill">—</span></div>
+        <div class="stat"><span class="k">joints (auto)</span><span id="cfg-joints" class="v">—</span></div>
+        <div class="stat"><span class="k">JTC (auto)</span><span id="cfg-jtc" class="v">—</span></div>
+        <div class="stat"><span class="k">FPC (auto)</span><span id="cfg-fpc" class="v">—</span></div>
+      </div>
+    </section>
+
+    <!-- Monitor -->
+    <section class="card">
+      <h2>Status</h2>
+      <div class="grid">
+        <div class="stat"><span class="k">enabled</span><span id="enabled" class="v pill">—</span></div>
+        <div class="stat"><span class="k">mode</span><span id="mode" class="v">—</span></div>
+        <div class="stat"><span class="k">model</span><span id="have_model" class="v pill">—</span></div>
+        <div class="stat"><span class="k">joint states</span><span id="js_fresh" class="v pill">—</span></div>
+        <div class="stat"><span class="k">controlled frame</span><span id="frame" class="v">—</span></div>
+        <div class="stat"><span class="k">base frame</span><span id="base" class="v">—</span></div>
+      </div>
+      <div class="msg" id="last_message">—</div>
+    </section>
+
+    <!-- Last solve -->
+    <section class="card">
+      <h2>Last solve</h2>
+      <div class="grid">
+        <div class="stat"><span class="k">reachable</span><span id="reachable" class="v pill">—</span></div>
+        <div class="stat"><span class="k">reason</span><span id="reason" class="v">—</span></div>
+        <div class="stat"><span class="k">pos err</span><span id="pos_err" class="v">—</span></div>
+        <div class="stat"><span class="k">ori err</span><span id="ori_err" class="v">—</span></div>
+        <div class="stat"><span class="k">joint step</span><span id="step" class="v">—</span></div>
+        <div class="stat"><span class="k">max step</span><span id="max_step" class="v">—</span></div>
+      </div>
+    </section>
+
+    <!-- Enable / disable -->
+    <section class="card">
+      <h2>Engage <span class="warn">(commands the real robot)</span></h2>
+      <div class="row">
+        <button id="btn-enable" class="btn btn-go">Enable</button>
+        <button id="btn-disable" class="btn btn-stop">Disable / Stop</button>
+      </div>
+    </section>
+
+    <!-- Jog -->
+    <section class="card">
+      <h2>Jog (capture current → offset → send)</h2>
+      <div class="row">
+        <label>step (m) <input id="jog-step" type="number" value="0.01" step="0.005" min="0.001" /></label>
+      </div>
+      <div class="jog">
+        <button class="btn" data-axis="x" data-sign="1">+X</button>
+        <button class="btn" data-axis="x" data-sign="-1">−X</button>
+        <button class="btn" data-axis="y" data-sign="1">+Y</button>
+        <button class="btn" data-axis="y" data-sign="-1">−Y</button>
+        <button class="btn" data-axis="z" data-sign="1">+Z</button>
+        <button class="btn" data-axis="z" data-sign="-1">−Z</button>
+      </div>
+    </section>
+
+    <!-- Target pose -->
+    <section class="card">
+      <h2>Target pose</h2>
+      <div class="row">
+        <label>x <input id="tx" type="number" step="0.01" /></label>
+        <label>y <input id="ty" type="number" step="0.01" /></label>
+        <label>z <input id="tz" type="number" step="0.01" /></label>
+      </div>
+      <div class="row">
+        <label>qw <input id="qw" type="number" step="0.01" value="1" /></label>
+        <label>qx <input id="qx" type="number" step="0.01" value="0" /></label>
+        <label>qy <input id="qy" type="number" step="0.01" value="0" /></label>
+        <label>qz <input id="qz" type="number" step="0.01" value="0" /></label>
+      </div>
+      <div class="row">
+        <label>frame_id <input id="fid" type="text" placeholder="(base frame)" /></label>
+      </div>
+      <div class="row">
+        <button id="btn-capture" class="btn">Capture current</button>
+        <button id="btn-send" class="btn btn-go">Send target</button>
+      </div>
+    </section>
+
+    <div class="msg" id="action-msg"></div>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
