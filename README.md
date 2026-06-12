@@ -109,6 +109,54 @@ workspace via `config/robot_config.yaml` or the `ROBOT_CONFIG_PATH` environment
 variable; CLI `key:=value` overrides win over everything. See each package's
 `README.md` for details.
 
+## Apply to a new robot
+
+Nothing in the toolkit names a specific robot — every package builds its model
+from your URDF and adapts at runtime. There is **no per-robot code to write**.
+
+**Python library (`ikt_core`) — works on any URDF immediately:**
+
+```python
+from ikt_core import IK
+ik = IK.from_urdf_file("my_robot.urdf")      # or .xacro, or a raw URDF string
+print(ik.joint_names, ik.link_names)         # discover frames/joints to target
+sol = ik.solve("my_tip_link", [x, y, z], [qw, qx, qy, qz])
+```
+
+Frame and joint names are whatever your URDF uses — there is no naming
+convention to follow. `solve(...)` auto-selects the joints on the kinematic path
+to the chosen frame; pass `active_joints=` to override, or `active_joints=None`
+for all joints.
+
+**ROS (solver + dashboard + motion) — checklist:**
+
+1. **URDF / state.** Have a bringup publish `/robot_description` and
+   `/joint_states` (any robot's `robot_state_publisher` + driver). Or skip the
+   topic and pass the model directly:
+   `ros2 launch ikt_inverse_kinematics ik.launch.py urdf_file:=/path/my_robot.urdf`.
+2. **Controllers (only for motion).** Load a `JointTrajectoryController` and/or a
+   `forward_command_controller` for your joints in `/controller_manager`. The
+   commander **auto-discovers** them by matching `<joint>/position` command
+   interfaces — controllers may be named anything (see
+   [`ikt_pose_commander`](ikt_pose_commander/README.md)).
+3. **Solve / visualize:** `ros2 launch ikt_inverse_kinematics ik_with_dashboard.launch.py`
+   → open http://localhost:8160, pick any link, Solve. (Advisory; never moves the robot.)
+4. **Move:** `ros2 launch ikt_pose_commander commander.launch.py dashboard_port:=8180`
+   → open http://localhost:8180, **Configure** the link to control (joints +
+   controllers auto-derive), **Enable**, then jog / send a target.
+5. **Optional — arm-angle (7-DOF S-R-S) redundancy.** Only this feature needs
+   per-robot frame names. Set `srs_chain_names` + `srs_chains.<name>.{shoulder,
+   elbow,wrist}` in your `robot_config.yaml` (template in
+   [`ikt_inverse_kinematics/config/ik_defaults.yaml`](ikt_inverse_kinematics/config/ik_defaults.yaml)).
+   Everything else works without it.
+
+**Requirements:** the URDF needs movable (revolute/prismatic) joints to the link
+you target; continuous joints are treated as unlimited. Mesh-free URDFs are
+fine (meshes only affect the dashboard's 3D rendering, not the solve). The
+dashboards default the operated link to a likely tip (a `*Link7` / `tool` /
+`tcp` / `gripper` / `flange` link, else the last link) and group active joints
+by link-name prefix — both are just UI defaults you can override in the dropdown.
+
 ## Safety
 
 `ikt_inverse_kinematics` is **advisory only**: it publishes IK *results*, never

@@ -219,10 +219,14 @@ function fillDropdowns(s) {
   act.innerHTML = '<option value="">all joints</option>';
   [...groups].sort().forEach((g) => act.appendChild(opt(g)));
   if (curA) act.value = curA;
-  // default operated frame: a tip link (prefer *Link7), not the world root
+  // default operated frame: a likely tip link, not the world root. Prefer a
+  // *Link7 tip, then common end-effector names, else the last (deepest) link —
+  // robot-agnostic, matches the commander dashboard.
   const cur = $("frame").value;
   if ((!cur || cur === "world" || cur === "base_link") && links.length) {
-    const tip = links.find((l) => /Link7$/.test(l)) || links[links.length - 1];
+    const tip = links.find((l) => /Link7$/.test(l))
+      || links.find((l) => /(tool|tcp|_ee$|hand|gripper|flange)/i.test(l))
+      || links[links.length - 1];
     $("frame").value = tip;
     onFrameChange();
   }
