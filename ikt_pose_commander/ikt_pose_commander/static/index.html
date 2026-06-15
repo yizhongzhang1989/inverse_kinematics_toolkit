@@ -15,15 +15,50 @@
   </script>
 </head>
 <body>
-  <!-- 3D viewer fills the area to the right of the panel -->
-  <div id="stage"><canvas id="viewer"></canvas></div>
-  <div id="loading"><div class="spinner"></div>Waiting for /robot_description…</div>
+  <!-- 3D viewer fills the area to the right of the panel. All 3D-related
+       controls and live data float DIRECTLY on the canvas as overlays
+       (mirrors external/cartesian_controllers_toolkit/cartesian_controller_dashboard). -->
+  <div id="stage">
+    <canvas id="viewer"></canvas>
+    <div id="labels"></div>
 
-  <div id="hud">
-    <button id="fit" class="btn sm" title="frame the robot">fit view</button>
-    <span id="tgt-read" class="muted">no target yet</span>
-    <span id="conn" class="pill pill-bad">connecting…</span>
+    <!-- top-left: connection + live commanded-target readout -->
+    <div id="hud">
+      <span id="conn" class="pill pill-bad">connecting…</span>
+      <span id="tgt-read" class="muted">no target yet</span>
+    </div>
+
+    <!-- top-right floating overlay: 3D controls + live data, on the canvas -->
+    <div id="view-float">
+      <div class="vf-header">
+        <span class="vf-title">3D View</span>
+        <span class="pill" id="model-pill">—</span>
+        <button id="vf-collapse" type="button" class="vf-toggle"
+                aria-expanded="true" title="Collapse">−</button>
+      </div>
+      <div class="vf-body" id="vf-body">
+        <div class="vf-rows">
+          <span>links</span><span class="num" id="n-links">—</span>
+          <span>joints</span><span class="num" id="n-joints">—</span>
+          <span>selected</span><span class="num" id="sel-link">—</span>
+        </div>
+        <div class="vf-controls">
+          <label><input type="checkbox" id="show-mesh" checked> mesh</label>
+          <label><input type="checkbox" id="show-labels" checked> labels</label>
+          <label><input type="checkbox" id="show-frames"> frames</label>
+        </div>
+        <div class="vf-buttons">
+          <button id="fit" type="button" class="btn sm">Fit view</button>
+        </div>
+        <div class="vf-section">Joint angles</div>
+        <div class="vf-joints" id="joint-bars"><div class="muted sm">waiting for model…</div></div>
+        <div class="vf-section">TCP pose <span class="muted" id="tcp-frame"></span></div>
+        <div class="vf-tcp" id="tcp-pose"><div class="muted sm">no controlled frame</div></div>
+        <div class="vf-hint">click a link to select &middot; drag orbit &middot; wheel zoom</div>
+      </div>
+    </div>
   </div>
+  <div id="loading"><div class="spinner"></div>Waiting for /robot_description…</div>
 
   <div id="panel">
     <h1>Pose Commander <span class="muted">· 3D target view</span></h1>

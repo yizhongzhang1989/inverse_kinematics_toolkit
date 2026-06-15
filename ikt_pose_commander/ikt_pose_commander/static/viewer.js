@@ -5,16 +5,32 @@
 // configuration (per-link FK computed server-side, mirrored from the
 // ikt_inverse_kinematics dashboard) PLUS a triad + sphere at the *commanded
 // target pose* (whatever is currently on <ns>/target_pose — the dashboard's own
-// jog/send OR the spacemouse_servo teleop bridge). This is the visual check for
-// "is the SpaceMouse sending the right command?".
+// jog/send OR the spacemouse_servo teleop bridge).
+//
+// On top of the basic robot + target view it adds (referring to the other
+// toolkit dashboards):
+//   * a "mesh" toggle (solid meshes vs. link-frame skeleton);
+//   * per-link name labels (HTML overlay, toggle);
+//   * per-link coordinate frames (toggle);
+//   * click-to-select a link in 3D — highlights it and fills the
+//     controlled-link dropdown;
+//   * a live joint-angle panel and a controlled-frame TCP-pose panel.
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
 
 const $ = (id) => document.getElementById(id);
+const DEG = 180 / Math.PI;
+
+// Per-joint color palette for the on-canvas joint bars (matches the 6-axis
+// convention used by the other toolkit dashboards: J1=blue, J2=green,
+// J3=orange, J4=red, J5=purple, J6=cyan; extra axes cycle).
+const JOINT_COLORS = ["#42a5f5", "#66bb6a", "#ffa726",
+                      "#ef5350", "#ab47bc", "#26c6da"];
 
 // ---- scene --------------------------------------------------------------
 const canvas = $("viewer");
+const labelsEl = $("labels");
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0f1419);
 const vw = () => canvas.clientWidth || (innerWidth - 360);
@@ -46,10 +62,42 @@ targetGroup.add(targetBall);
 targetGroup.add(new THREE.AxesHelper(0.18));   // larger than base: the target's orientation
 
 const solidMat = new THREE.MeshStandardMaterial({ color: 0x9fb4c4, metalness: 0.25, roughness: 0.6 });
+const highlightMat = new THREE.MeshStandardMaterial({ color: 0xffb454, emissive: 0x6e3d00,
+  emissiveIntensity: 0.6, metalness: 0.2, roughness: 0.5 });
 const stlLoader = new STLLoader();
 const geomCache = {};   // url -> {geom, waiting:[cb]}
 const meshItems = {};   // key(link#i) -> {link, local, solid}
+const frameAxes = {};   // link -> AxesHelper
+const labelPool = [];   // reusable label divs (clustered, not per-link)
+let allLinks = [];      // link names from the snapshot
+let jointTree = [];     // [{parent, child, type}] for the skeleton lines
 let didFit = false;
+
+// ---- view options (checkboxes) ------------------------------------------
+const opt = { mesh: true, labels: true, frames: false };
+function readOpts() {
+  if ($("show-mesh")) opt.mesh = $("show-mesh").checked;
+  if ($("show-labels")) opt.labels = $("show-labels").checked;
+  if ($("show-frames")) opt.frames = $("show-frames").checked;
+}
+["show-mesh", "show-labels", "show-frames"].forEach((id) => {
+  const el = $(id);
+  if (el) el.addEventListener("change", () => { readOpts(); refreshStatic(); });
+});
+
+// ---- selection (synced with the controlled-link dropdown) ---------------
+let selectedLink = "";
+function dropdown() { return $("link-select"); }
+function setSelected(link, pushToDropdown) {
+  selectedLink = link || "";
+  if ($("sel-link")) $("sel-link").textContent = selectedLink || "—";
+  if (pushToDropdown) {
+    const dd = dropdown();
+    if (dd && [...dd.options].some((o) => o.value === selectedLink)) {
+      if (dd.value !== selectedLink) { dd.value = selectedLink; dd.dispatchEvent(new Event("change")); }
+    }
+  }
+}
 
 function getGeom(url, cb) {
   const c = geomCache[url];
@@ -83,6 +131,7 @@ function ensureMeshes(visuals) {
     meshItems[key] = item;
     getGeom(v.url, (geom) => {
       const s = new THREE.Mesh(geom, solidMat); s.matrixAutoUpdate = false;
+      s.userData.link = v.link;          // for raycast → link lookup
       item.solid = s; scene.add(s);
     });
   });
@@ -91,25 +140,128 @@ function placeCurrent(linkTf) {
   for (const key in meshItems) {
     const it = meshItems[key]; if (!it.solid) continue;
     const lm = linkTf[it.link];
-    if (!lm) { it.solid.visible = false; continue; }
+    if (!lm || !opt.mesh) { it.solid.visible = false; continue; }
     it.solid.visible = true;
+    it.solid.material = (it.link === selectedLink) ? highlightMat : solidMat;
     it.solid.matrix.copy(rosMat(lm).multiply(it.local));
   }
 }
 
-// skeleton fallback (no meshes)
-let skelPts = null;
-function updateSkeleton(linkTf) {
-  if (Object.keys(meshItems).length) return;
+// ---- per-link coordinate frames (toggle) --------------------------------
+function ensureFrames(linkTf) {
+  for (const link in linkTf) {
+    if (frameAxes[link]) continue;
+    const ax = new THREE.AxesHelper(0.07);
+    ax.matrixAutoUpdate = false; ax.visible = false;
+    frameAxes[link] = ax; scene.add(ax);
+  }
+}
+function placeFrames(linkTf) {
+  for (const link in frameAxes) {
+    const ax = frameAxes[link]; const lm = linkTf[link];
+    if (!lm || !opt.frames) { ax.visible = false; continue; }
+    ax.visible = true; ax.matrix.copy(rosMat(lm));
+  }
+}
+
+// ---- per-link name labels (HTML overlay, clustered) ---------------------
+// Links whose screen positions overlap — e.g. ft_sensor_link and
+// compliance_link mounted at the link_6 flange with zero offset — are MERGED
+// into a single comma-separated label so they don't stack illegibly on top of
+// each other (mirrors the reference cartesian_controller_dashboard). Uses a
+// reusable pool of divs, re-clustered every frame. Clicking a merged label
+// cycles the selection through the links it covers.
+const MERGE_PX = 18;     // screen-space merge radius (CSS px)
+function getLabelDiv(i) {
+  if (labelPool[i]) return labelPool[i];
+  const d = document.createElement("div");
+  d.className = "lbl";
+  d.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    const links = d._links || [];
+    if (!links.length) return;
+    const idx = links.indexOf(selectedLink);
+    setSelected(links[(idx + 1) % links.length], true);   // cycle within cluster
+  });
+  labelPool[i] = d; if (labelsEl) labelsEl.appendChild(d);
+  return d;
+}
+const _lv = new THREE.Vector3();
+function placeLabels(linkTf) {
+  if (!labelsEl) return;
+  if (!opt.labels) { for (const d of labelPool) d.style.display = "none"; return; }
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  // project every visible link origin to screen
+  const hits = [];
+  for (const link of allLinks) {
+    const lm = linkTf[link]; if (!lm) continue;
+    _lv.set(lm[0][3], lm[1][3], lm[2][3]).project(camera);
+    if (_lv.z > 1) continue;   // behind camera
+    hits.push({ link, x: (_lv.x * 0.5 + 0.5) * w, y: (-_lv.y * 0.5 + 0.5) * h });
+  }
+  // greedy cluster by screen distance — overlapping links share one label
+  const clusters = [];
+  for (const hit of hits) {
+    let merged = false;
+    for (const c of clusters) {
+      if (Math.hypot(hit.x - c.x, hit.y - c.y) < MERGE_PX) {
+        c.links.push(hit.link); merged = true; break;
+      }
+    }
+    if (!merged) clusters.push({ x: hit.x, y: hit.y, links: [hit.link] });
+  }
+  // render one div per cluster, reusing the pool
+  let i = 0;
+  for (; i < clusters.length; i++) {
+    const c = clusters[i]; const d = getLabelDiv(i);
+    d._links = c.links;
+    d.textContent = c.links.join(", ");
+    d.style.display = "block";
+    d.style.left = c.x.toFixed(0) + "px";
+    d.style.top = c.y.toFixed(0) + "px";
+    d.classList.toggle("sel", c.links.includes(selectedLink));
+  }
+  for (; i < labelPool.length; i++) labelPool[i].style.display = "none";
+}
+
+// ---- skeleton (joint-connectivity lines + link dots) --------------------
+// A proper kinematic skeleton — a line segment between each joint's parent and
+// child link origins, plus a dot at every link origin — shown when meshes are
+// off (or the model has no meshes). Mirrors the reference dashboard, which is
+// skeleton-only.
+let skelLines = null, skelDots = null;
+function ensureSkeleton() {
+  if (!skelLines) {
+    skelLines = new THREE.LineSegments(new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: 0x34c3ff }));
+    skelLines.frustumCulled = false; scene.add(skelLines);
+  }
+  if (!skelDots) {
+    skelDots = new THREE.Points(new THREE.BufferGeometry(),
+      new THREE.PointsMaterial({ color: 0xe6e6e6, size: 0.022 }));
+    skelDots.frustumCulled = false; scene.add(skelDots);
+  }
+}
+function updateSkeleton(linkTf, show) {
+  ensureSkeleton();
+  skelLines.visible = show; skelDots.visible = show;
+  if (!show) return;
+  // lines: parent origin -> child origin for each joint in the tree
+  const segs = [];
+  for (const j of jointTree) {
+    const a = linkTf[j.parent], b = linkTf[j.child];
+    if (!a || !b) continue;
+    segs.push(a[0][3], a[1][3], a[2][3], b[0][3], b[1][3], b[2][3]);
+  }
+  skelLines.geometry.setAttribute("position",
+    new THREE.Float32BufferAttribute(segs, 3));
+  skelLines.geometry.computeBoundingSphere();
+  // dots at every link origin
   const pts = [];
   for (const k in linkTf) { const m = linkTf[k]; pts.push(m[0][3], m[1][3], m[2][3]); }
-  if (!skelPts) {
-    skelPts = new THREE.Points(new THREE.BufferGeometry(),
-      new THREE.PointsMaterial({ color: 0x34c3ff, size: 0.03 }));
-    scene.add(skelPts);
-  }
-  skelPts.geometry.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
-  skelPts.geometry.computeBoundingSphere();
+  skelDots.geometry.setAttribute("position",
+    new THREE.Float32BufferAttribute(pts, 3));
+  skelDots.geometry.computeBoundingSphere();
 }
 
 function frameBox(linkTf) {
@@ -132,6 +284,25 @@ function fitView(linkTf) {
   if (!frameBox(linkTf)) return;
   resetView(linkTf); didFit = true;
 }
+
+// ---- click-to-select a link (raycast) -----------------------------------
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let downXY = null;
+canvas.addEventListener("pointerdown", (e) => { downXY = [e.clientX, e.clientY]; });
+canvas.addEventListener("pointerup", (e) => {
+  if (!downXY) return;
+  const moved = Math.hypot(e.clientX - downXY[0], e.clientY - downXY[1]);
+  downXY = null;
+  if (moved > 5) return;                       // it was an orbit drag, not a click
+  const r = canvas.getBoundingClientRect();
+  ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const solids = Object.values(meshItems).map((it) => it.solid).filter((m) => m && m.visible);
+  const hit = raycaster.intersectObjects(solids, false)[0];
+  if (hit && hit.object.userData.link) setSelected(hit.object.userData.link, true);
+});
 
 // ---- live target --------------------------------------------------------
 function updateTarget(t) {
@@ -156,20 +327,128 @@ function updateTarget(t) {
   }
 }
 
+// ---- joint-angle panel (colored bars, centre-line fill) -----------------
+const jointRowEls = {};   // jn -> {bar, val}
+function buildJointRows(joints) {
+  const host = $("joint-bars"); if (!host) return;
+  if (host.dataset.n === String(joints.length)) return;   // already built
+  host.dataset.n = String(joints.length);
+  host.innerHTML = "";
+  for (const k in jointRowEls) delete jointRowEls[k];
+  joints.forEach((jn, i) => {
+    const color = JOINT_COLORS[i % JOINT_COLORS.length];
+    const row = document.createElement("div"); row.className = "jbrow";
+    row.innerHTML =
+      `<span class="jblabel" style="color:${color}" title="${jn}">J${i + 1}</span>`
+      + `<span class="jbbg"><span class="jbcenter"></span>`
+      + `<span class="jbbar"></span></span>`
+      + `<span class="jbval">—</span>`;
+    row.addEventListener("pointerdown", () => {
+      // selecting the joint highlights the child link it actuates (best-effort)
+    });
+    host.appendChild(row);
+    jointRowEls[jn] = { bar: row.querySelector(".jbbar"),
+                        val: row.querySelector(".jbval"), color };
+  });
+}
+function updateJointPanel(joints, values, limits) {
+  const host = $("joint-bars"); if (!host) return;
+  if (!joints || !joints.length || !values) {
+    host.innerHTML = '<div class="muted sm">no joints</div>'; host.dataset.n = "";
+    return;
+  }
+  buildJointRows(joints);
+  for (const jn of joints) {
+    const row = jointRowEls[jn]; if (!row) continue;
+    const rad = Number(values[jn] ?? 0);
+    const lim = (limits && limits[jn]) || [null, null];
+    // symmetric display range from the limits (fallback ±π)
+    let span = Math.PI;
+    if (lim[0] != null && lim[1] != null) span = Math.max(Math.abs(lim[0]), Math.abs(lim[1])) || Math.PI;
+    const frac = Math.max(-1, Math.min(1, rad / span));   // -1..1
+    const pct = Math.abs(frac) * 50;
+    const b = row.bar;
+    b.style.background = row.color;
+    if (frac >= 0) { b.classList.add("positive"); b.classList.remove("negative"); b.style.left = "50%"; b.style.right = ""; }
+    else { b.classList.add("negative"); b.classList.remove("positive"); b.style.right = "50%"; b.style.left = ""; }
+    b.style.width = pct.toFixed(1) + "%";
+    row.val.textContent = (rad * DEG).toFixed(1) + "°";
+  }
+}
+
+// ---- TCP-pose panel (controlled frame) ----------------------------------
+const _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _s = new THREE.Vector3();
+function updateTcp(linkTf, frame) {
+  const host = $("tcp-pose"); if (!host) return;
+  const fl = $("tcp-frame");
+  if (!frame || !linkTf || !linkTf[frame]) {
+    if (fl) fl.textContent = "";
+    host.innerHTML = '<div class="muted sm">no controlled frame (Configure a link)</div>'; return;
+  }
+  if (fl) fl.textContent = "· " + frame;
+  rosMat(linkTf[frame]).decompose(_p, _q, _s);
+  const e = new THREE.Euler().setFromQuaternion(_q, "ZYX");
+  host.innerHTML =
+    `<div class="trow"><span class="k">xyz m</span><span class="v">`
+    + `${_p.x.toFixed(4)}, ${_p.y.toFixed(4)}, ${_p.z.toFixed(4)}</span></div>`
+    + `<div class="trow"><span class="k">rpy °</span><span class="v">`
+    + `${(e.x * DEG).toFixed(1)}, ${(e.y * DEG).toFixed(1)}, ${(e.z * DEG).toFixed(1)}</span></div>`
+    + `<div class="trow"><span class="k">quat</span><span class="v">`
+    + `${_q.w.toFixed(3)}, ${_q.x.toFixed(3)}, ${_q.y.toFixed(3)}, ${_q.z.toFixed(3)}</span></div>`;
+}
+
+// Re-apply visibility/highlight to the static scene after a toggle change,
+// using the last link transforms (no need to wait for the next poll).
+function refreshStatic() {
+  const tf = window.__lastLinkTf;
+  if (!tf) return;
+  placeCurrent(tf); placeFrames(tf); placeLabels(tf);
+  updateSkeleton(tf, !opt.mesh || !window.__hasMeshes);
+}
+
 // ---- poll ---------------------------------------------------------------
 async function poll() {
   let s;
   try { s = await (await fetch("/api/state")).json(); } catch { return; }
+  readOpts();
+  // keep selection in sync if the user changed the dropdown directly
+  const dd = dropdown();
+  if (dd && dd.value && dd.value !== selectedLink) setSelected(dd.value, false);
+
   if (s.has_model_viz) {
     const ld = $("loading"); if (ld) ld.style.display = "none";
-    if (s.has_meshes) { ensureMeshes(s.visuals || []); placeCurrent(s.link_tf || {}); }
-    else updateSkeleton(s.link_tf || {});
-    fitView(s.link_tf);
-    window.__lastLinkTf = s.link_tf;
+    const tf = s.link_tf || {};
+    window.__hasMeshes = !!s.has_meshes;
+    allLinks = s.links || Object.keys(tf);
+    jointTree = s.joint_tree || [];
+    if (s.has_meshes) ensureMeshes(s.visuals || []);
+    ensureFrames(tf);
+    placeCurrent(tf); placeFrames(tf); placeLabels(tf);
+    updateSkeleton(tf, !opt.mesh || !s.has_meshes);
+    fitView(tf);
+    window.__lastLinkTf = tf;
+    // floating-overlay counts + model pill
+    if ($("n-links")) $("n-links").textContent = (s.links || []).length || "—";
+    if ($("n-joints")) $("n-joints").textContent = (s.joints || []).length || "—";
+    if ($("model-pill")) {
+      $("model-pill").textContent = s.has_meshes ? "meshes" : "skeleton";
+      $("model-pill").className = "pill pill-good";
+    }
+    updateJointPanel(s.joints, s.joint_values, s.joint_limits);
+    updateTcp(tf, s.controlled_frame);
+    // default the selection to the controlled frame the first time we see it
+    if (!selectedLink && s.controlled_frame) setSelected(s.controlled_frame, false);
   }
   updateTarget(s.target);
 }
 if ($("fit")) $("fit").onclick = () => resetView();
+// collapse / expand the floating overlay
+if ($("vf-collapse")) $("vf-collapse").onclick = () => {
+  const f = $("view-float"); const b = $("vf-collapse");
+  const collapsed = f.classList.toggle("collapsed");
+  b.textContent = collapsed ? "+" : "−";
+  b.setAttribute("aria-expanded", String(!collapsed));
+};
 poll(); setInterval(poll, 120);
 
 // ---- render loop --------------------------------------------------------
@@ -185,4 +464,6 @@ function resizeToDisplay() {
 (function animate() {
   requestAnimationFrame(animate);
   resizeToDisplay(); controls.update(); renderer.render(scene, camera);
+  // labels track the camera every frame (cheap; ~9 divs)
+  if (window.__lastLinkTf) placeLabels(window.__lastLinkTf);
 })();

@@ -120,6 +120,31 @@ def parse_visuals(urdf_xml: str) -> List[dict]:
     return out
 
 
+def parse_joint_tree(urdf_xml: str) -> List[dict]:
+    """Extract the URDF joint topology for the 3D skeleton.
+
+    Returns ``[{parent, child, type}]`` (parent/child are link names). The
+    viewer draws a line segment between the world origins of ``parent`` and
+    ``child`` for each joint, which gives a proper kinematic skeleton (rather
+    than disconnected per-link dots).
+    """
+    out: List[dict] = []
+    try:
+        root = ET.fromstring(urdf_xml)
+    except Exception:
+        return out
+    for j in root.findall("joint"):
+        p = j.find("parent")
+        c = j.find("child")
+        if p is None or c is None:
+            continue
+        pl, cl = p.get("link"), c.get("link")
+        if pl and cl:
+            out.append({"parent": pl, "child": cl,
+                        "type": j.get("type", "fixed")})
+    return out
+
+
 def _quat_wxyz_to_R(q) -> np.ndarray:
     w, x, y, z = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
     n = (w * w + x * x + y * y + z * z) ** 0.5
@@ -187,6 +212,7 @@ class CommanderDashboard(Node):
         self._urdf = ""
         self._model: Optional["RobotModel"] = None
         self._visuals: List[dict] = []
+        self._joint_tree: List[dict] = []
         self._joint_pos: Dict[str, float] = {}
         self._pkg_dirs: Dict[str, Optional[str]] = {}
         # live commanded target (from <ns>/target_pose, incl. spacemouse_servo)
@@ -252,15 +278,17 @@ class CommanderDashboard(Node):
         try:
             model = RobotModel(msg.data)
             vis = parse_visuals(msg.data)
+            jtree = parse_joint_tree(msg.data)
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error("failed to build model/visuals: %r" % exc)
             return
         with self._lock:
             self._model = model
             self._visuals = vis
+            self._joint_tree = jtree
         self.get_logger().info(
-            "3D view: built model (%d DOF, %d links, %d mesh visuals)."
-            % (model.nq, len(model.link_frame_names()), len(vis)))
+            "3D view: built model (%d DOF, %d links, %d mesh visuals, %d joints)."
+            % (model.nq, len(model.link_frame_names()), len(vis), len(jtree)))
 
     def _on_js(self, msg: JointState) -> None:
         with self._lock:
@@ -366,6 +394,7 @@ class CommanderDashboard(Node):
                 else None
             model = self._model
             visuals = list(self._visuals)
+            joint_tree = list(self._joint_tree)
         fresh = age is not None and age <= self._stale
         out = {"status": s, "fresh": fresh,
                "age": round(age, 2) if age is not None else None,
@@ -383,6 +412,30 @@ class CommanderDashboard(Node):
                 for v in visuals]
             out["skeleton"] = {k: [m[0][3], m[1][3], m[2][3]]
                                for k, m in link_tf.items()}
+            # Joint topology (parent/child link names) so the viewer can draw a
+            # proper kinematic skeleton (lines parent->child), not just dots.
+            out["joint_tree"] = joint_tree
+            # Link / joint introspection for the 3D viewer's labels, link list,
+            # highlight, and the joint-angle + TCP-pose panels.
+            out["links"] = model.link_frame_names()
+            out["joints"] = list(model.joint_names)
+            out["joint_values"] = {jn: float(q[model.q_index(jn)])
+                                   for jn in model.joint_names}
+            # Per-joint (lower, upper) limits for the on-canvas joint bars;
+            # non-finite (continuous) limits are sent as null so the viewer
+            # falls back to a +/-pi display range.
+            try:
+                lo, hi = model.joint_limits()
+                jl = {}
+                for jn in model.joint_names:
+                    i = model.q_index(jn)
+                    lov, hiv = float(lo[i]), float(hi[i])
+                    jl[jn] = [lov if np.isfinite(lov) else None,
+                              hiv if np.isfinite(hiv) else None]
+                out["joint_limits"] = jl
+            except Exception:  # noqa: BLE001
+                out["joint_limits"] = {}
+            out["controlled_frame"] = (s or {}).get("controlled_frame")
         return out
 
     def _controlled_frame(self) -> Optional[str]:
