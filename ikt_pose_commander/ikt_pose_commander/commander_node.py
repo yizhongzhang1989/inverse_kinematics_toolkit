@@ -44,6 +44,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy, qos_profile_sensor_data)
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
@@ -84,6 +85,22 @@ def _latched_qos() -> QoSProfile:
     )
 
 
+# Runtime-config keys, split by HOW they apply. ``_LIVE_KEYS`` take effect
+# immediately (even while enabled); ``_STRUCTURAL_KEYS`` change the kinematic
+# group / controllers and are refused while enabled (disable first). Launch
+# params, the ``~/configure`` topic, AND ``ros2 param set`` all funnel through
+# the same apply path -> ONE unified way to set any of them, at launch or live.
+_LIVE_KEYS = (
+    "base_frame", "max_joint_speed", "min_move_time", "max_step_rad",
+    "joint_states_stale_after", "joint_centering_weight", "damping",
+    "tol_pos", "tol_ori", "max_iters", "default_stiffness",
+)
+_STRUCTURAL_KEYS = (
+    "controlled_frame", "joints", "jtc_controller", "fpc_controller",
+    "command_mode",
+)
+
+
 class PoseCommander(Node):
     def __init__(self) -> None:
         super().__init__("ikt_pose_commander")
@@ -92,6 +109,10 @@ class PoseCommander(Node):
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("target_pose_topic", "~/target_pose")
+        # base_frame: the frame a target with an EMPTY ``header.frame_id`` is
+        # assumed to be expressed in. Every target is transformed into the model
+        # root for the solver, so any TF frame works as a reference. Live /
+        # runtime-settable (see _LIVE_KEYS).
         self.declare_parameter("base_frame", "")
         # Robot-INDEPENDENT: everything below is empty by default. The node
         # builds its model from the live /robot_description and is configured at
@@ -176,8 +197,9 @@ class PoseCommander(Node):
         self._last_reason = ""
         self._last_delta = 0.0
         self._goal_handle = None
-        # a pending config request (from launch params or ~/configure) to apply
-        # once the model is available
+        # a pending config request (from launch params, ~/configure, or a staged
+        # ``ros2 param set``) to apply once the model is available
+        self._cfg_dirty = False
         self._req_cfg: Optional[dict] = None
         if self._frame:
             self._req_cfg = {"controlled_frame": self._frame,
@@ -234,6 +256,12 @@ class PoseCommander(Node):
 
         self.create_timer(1.0 / status_rate, self._publish_status,
                           callback_group=cb)
+
+        # Unified runtime config via standard parameters: ``ros2 param set``.
+        # Live tunables apply at once; structural ones are staged and applied by
+        # the status timer (so this callback never blocks on discovery). Same
+        # effect as the ``~/configure`` topic.
+        self.add_on_set_parameters_callback(self._on_set_params)
 
         if bool(gp("start_enabled").value):
             # honoured only after the first model+js arrive; _try_enable guards.
@@ -300,57 +328,178 @@ class PoseCommander(Node):
         except Exception as exc:  # noqa: BLE001
             self._set_msg("configure ignored: bad JSON (%s)" % exc)
             return
-        if not isinstance(req, dict) or not req.get("controlled_frame"):
-            self._set_msg("configure ignored: need {'controlled_frame': ...}")
+        if not isinstance(req, dict):
+            self._set_msg("configure ignored: need a JSON object")
+            return
+        if not any(k in req for k in (_LIVE_KEYS + _STRUCTURAL_KEYS)):
+            self._set_msg("configure ignored: no known config keys")
+            return
+        # Live tunables apply immediately, even before a model exists.
+        live = self._apply_live(req)
+        if not any(k in req for k in _STRUCTURAL_KEYS):
+            self._set_msg("configured (live): " + (live or "no changes"))
             return
         with self._lock:
-            self._req_cfg = req
             have_model = self._model is not None
         if not have_model:
-            self._set_msg("configure queued: waiting for /robot_description")
+            with self._lock:
+                base = dict(self._req_cfg or {})
+                base.update(req)
+                self._req_cfg = base
+            self._set_msg("configure queued: waiting for /robot_description"
+                          + (("; live: " + live) if live else ""))
             return
-        ok, m = self._apply_config(req)
+        ok, m = self._apply_structural(req)
+        if live:
+            m = "live: " + live + "; " + m
         self._set_msg(("configured: " if ok else "configure failed: ") + m)
 
-    def _apply_config(self, req: dict):
-        """Validate + apply a config: name the link, derive joints+controllers.
+    def _on_set_params(self, params):
+        """Unified runtime setter through standard parameters.
 
-        Refused while enabled (disable first). ``joints`` and the JTC/FPC
-        controller names are optional in ``req``; when omitted they are derived
-        from the model (joints = kinematic path to the link) and from
-        /controller_manager (controllers whose required command interfaces cover
-        those joints).
+        Live tunables apply immediately; structural params are staged and
+        applied by the status timer (so we never block on controller discovery
+        inside this callback), and are rejected while enabled to keep the
+        parameter store consistent with the active config.
+        """
+        live: dict = {}
+        structural: dict = {}
+        for p in params:
+            if p.name in _LIVE_KEYS:
+                live[p.name] = p.value
+            elif p.name in _STRUCTURAL_KEYS:
+                structural[p.name] = p.value
+        if structural:
+            with self._lock:
+                enabled = self._enabled
+            if enabled:
+                return SetParametersResult(
+                    successful=False,
+                    reason="disable before changing structural config (%s)"
+                    % ", ".join(sorted(structural)))
+        if live:
+            m = self._apply_live(live)
+            if m:
+                self._set_msg("param set: " + m)
+        if structural:
+            with self._lock:
+                base = dict(self._req_cfg or {})
+                base.update(structural)
+                self._req_cfg = base
+                self._cfg_dirty = True
+        return SetParametersResult(successful=True)
+
+    def _apply_config(self, req: dict):
+        """Unified apply: live tunables + (optional) structural reconfig.
+
+        Launch params and every runtime setter (``~/configure`` topic,
+        ``ros2 param set``) funnel through here so there is a single behaviour.
+        Live keys always apply; structural keys are refused while enabled.
+        """
+        live = self._apply_live(req)
+        if any(k in req for k in _STRUCTURAL_KEYS):
+            ok, m = self._apply_structural(req)
+            return ok, (("live: " + live + "; " + m) if live else m)
+        return True, ("live: " + live if live else "no changes")
+
+    def _apply_live(self, req: dict) -> str:
+        """Apply pose-independent tunables that are safe to change anytime.
+
+        Returns a short description of what changed ("" if nothing). Covers the
+        base reference frame, the solver weights/tolerances, and the safety
+        limits. Robust to string values (so JSON and typed params both work).
+        """
+        changed: List[str] = []
+        with self._lock:
+            for key, attr, lo in (
+                ("max_joint_speed", "_max_speed", 1e-3),
+                ("min_move_time", "_min_time", 0.0),
+                ("max_step_rad", "_max_step", None),
+                ("joint_states_stale_after", "_js_stale", None),
+                ("joint_centering_weight", "_centering", None),
+                ("damping", "_damping", None),
+                ("tol_pos", "_tol_pos", None),
+                ("tol_ori", "_tol_ori", None),
+            ):
+                if req.get(key) is None:
+                    continue
+                try:
+                    v = float(req[key])
+                except (TypeError, ValueError):
+                    continue
+                if lo is not None:
+                    v = max(lo, v)
+                setattr(self, attr, v)
+                changed.append("%s=%g" % (key, v))
+            if req.get("max_iters") is not None:
+                try:
+                    self._max_iters = max(1, int(req["max_iters"]))
+                    changed.append("max_iters=%d" % self._max_iters)
+                except (TypeError, ValueError):
+                    pass
+            if req.get("default_stiffness") is not None:
+                try:
+                    s = [float(x) for x in req["default_stiffness"]]
+                    if len(s) == 6:
+                        self._stiffness = s
+                        changed.append("default_stiffness")
+                except (TypeError, ValueError):
+                    pass
+            if "base_frame" in req and req["base_frame"] is not None:
+                self._base_frame = str(req["base_frame"] or "")
+                changed.append("base_frame=%s" % (self._base_frame or "(root)"))
+        return ", ".join(changed)
+
+    def _apply_structural(self, req: dict):
+        """Apply a kinematic-group / controller reconfig. Refused while enabled.
+
+        ``controlled_frame`` (or ``joints``) selects the group; when both are
+        omitted the current group is kept and only e.g. ``command_mode`` changes.
+        ``joints`` and the JTC/FPC controller names are optional; when omitted
+        they are derived from the model (joints = kinematic path to the link)
+        and from /controller_manager (controllers whose required command
+        interfaces cover those joints).
         """
         with self._lock:
             if self._enabled:
                 return False, "refused: disable before reconfiguring"
             model = self._model
+            cur_frame, cur_joints = self._frame, list(self._joints)
+            cur_jtc, cur_fpc, cur_mode = self._jtc, self._fpc, self._mode
+            cur_configured = self._configured
         if model is None:
             return False, "no model yet"
 
-        frame = str(req.get("controlled_frame") or "")
-        if not model.has_frame(frame):
-            return False, f"unknown link/frame '{frame}'"
-
-        # joints: explicit or derived from the kinematic path to the link
-        joints = req.get("joints")
-        if joints:
-            joints = [str(j) for j in joints if str(j)]
-            missing = [j for j in joints if j not in model.joint_names]
-            if missing:
-                return False, f"joints not in URDF: {missing}"
+        changing_group = ("controlled_frame" in req) or ("joints" in req)
+        if changing_group:
+            frame = str(req.get("controlled_frame") or cur_frame or "")
+            if not frame or not model.has_frame(frame):
+                return False, f"unknown link/frame '{frame}'"
+            joints = req.get("joints")
+            if joints:
+                joints = [str(j) for j in joints if str(j)]
+                missing = [j for j in joints if j not in model.joint_names]
+                if missing:
+                    return False, f"joints not in URDF: {missing}"
+            else:
+                joints = model.supporting_joints(frame)
+                if not joints:
+                    return False, f"no movable joints support frame '{frame}'"
         else:
-            joints = model.supporting_joints(frame)
-            if not joints:
-                return False, f"no movable joints support frame '{frame}'"
+            if not cur_configured:
+                return False, "not configured; set controlled_frame first"
+            frame, joints = cur_frame, cur_joints
 
-        mode = str(req.get("command_mode") or self._mode).strip().lower()
+        mode = str(req.get("command_mode") or cur_mode).strip().lower()
         if mode not in ("jtc", "fpc"):
             return False, "command_mode must be 'jtc' or 'fpc'"
 
-        # controllers: explicit or discovered from /controller_manager
+        # controllers: explicit > kept (only if the group is unchanged) > derived
         jtc = str(req.get("jtc_controller") or "")
         fpc = str(req.get("fpc_controller") or "")
+        if not changing_group:
+            jtc = jtc or cur_jtc
+            fpc = fpc or cur_fpc
         if not jtc or not fpc:
             disc = self._discover_controllers(joints)
             jtc = jtc or disc.get("jtc", "")
@@ -510,25 +659,46 @@ class PoseCommander(Node):
                              active_joints=self._joints)
 
     def _resolve_pose(self, msg: PoseStamped):
-        """Return (xyz, quat_wxyz) in the base frame, or (None, None)."""
+        """Return (xyz, quat_wxyz) for the target expressed in the SOLVER frame
+        (the model root), or (None, None).
+
+        Pinocchio expresses the controlled frame's placement in the model root
+        frame, so every target must be resolved into that root frame before the
+        solve. ``base_frame`` is the *default* frame a bare target (empty
+        ``header.frame_id``) is interpreted in; an explicit ``header.frame_id``
+        always wins. Either is transformed to the root via TF, so any TF frame
+        (a robot link or an external frame, e.g. a camera) is a valid reference.
+        """
         p, o = msg.pose.position, msg.pose.orientation
         xyz = np.array([p.x, p.y, p.z])
         quat = np.array([o.w, o.x, o.y, o.z])
         n = float(np.linalg.norm(quat))
         quat = quat / n if n > 1e-9 else np.array([1.0, 0.0, 0.0, 0.0])
-        src = msg.header.frame_id
-        if not src or self._tf_buffer is None or src == self._base_frame:
+
+        root = self._model_root()
+        with self._lock:
+            base = self._base_frame
+        # The frame the target is expressed in: explicit frame_id wins, else the
+        # configured base_frame, else the root itself.
+        src = msg.header.frame_id or base or root
+        if self._tf_buffer is None or src == root:
             return xyz, quat
         try:
             import tf2_geometry_msgs  # noqa: F401  (registers Pose transforms)
-            target = self._base_frame or self._model_root()
+            stamped = msg
+            if not msg.header.frame_id:
+                # stamp the assumed source frame so TF can resolve it (latest)
+                stamped = PoseStamped()
+                stamped.header.frame_id = src
+                stamped.pose = msg.pose
             out = self._tf_buffer.transform(
-                msg, target, timeout=rclpy.duration.Duration(seconds=0.2))
+                stamped, root, timeout=rclpy.duration.Duration(seconds=0.2))
             p, o = out.pose.position, out.pose.orientation
             return (np.array([p.x, p.y, p.z]),
                     np.array([o.w, o.x, o.y, o.z]))
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn("TF resolve failed: %r" % exc)
+            self.get_logger().warn(
+                "TF resolve %s->%s failed: %r" % (src, root, exc))
             return None, None
 
     def _model_root(self) -> str:
@@ -697,6 +867,15 @@ class PoseCommander(Node):
         self.get_logger().info("[commander] %s" % msg)
 
     def _publish_status(self) -> None:
+        # Apply any config staged by a ``ros2 param set`` (done here, off the
+        # set-parameters callback, so controller discovery never blocks it).
+        if self._cfg_dirty:
+            with self._lock:
+                req = dict(self._req_cfg or {})
+                self._cfg_dirty = False
+            ok, m = self._apply_config(req)
+            self._set_msg(("reconfigured: " if ok else "reconfigure failed: ")
+                          + m)
         with self._lock:
             model = self._model
             enabled = self._enabled

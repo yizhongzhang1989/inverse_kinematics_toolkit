@@ -37,7 +37,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument("port", default_value=str(d["dashboard_port"])),
         DeclareLaunchArgument("commander_ns",
-                              default_value="/ikt_pose_commander_right"),
+                              default_value="/ikt_pose_commander"),
         DeclareLaunchArgument("base_frame",
                               default_value=str(d["dashboard_base_frame"])),
     ]

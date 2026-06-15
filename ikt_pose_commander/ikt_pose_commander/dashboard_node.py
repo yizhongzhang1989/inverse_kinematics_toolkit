@@ -188,7 +188,7 @@ class CommanderDashboard(Node):
     def __init__(self) -> None:
         super().__init__("ikt_pose_commander_dashboard")
         self.declare_parameter("port", 8180)
-        self.declare_parameter("commander_ns", "/ikt_pose_commander_right")
+        self.declare_parameter("commander_ns", "/ikt_pose_commander")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("status_stale_after", 2.0)
         self.declare_parameter("robot_description_topic", "/robot_description")

@@ -73,6 +73,24 @@ async function poll() {
     }
   }
 
+  // populate the base-link dropdown (target reference frame): all links plus a
+  // "(robot root)" = empty default. Runtime-changeable like the controlled link.
+  const bsel = $("base-select");
+  if (links.length && bsel.dataset.count != String(links.length)) {
+    const cur = bsel.value;
+    bsel.innerHTML = "";
+    const root = document.createElement("option");
+    root.value = ""; root.textContent = "(robot root)"; bsel.appendChild(root);
+    for (const l of links) {
+      const o = document.createElement("option");
+      o.value = l; o.textContent = l; bsel.appendChild(o);
+    }
+    bsel.dataset.count = String(links.length);
+    const b = s.base_frame;
+    bsel.value = (b && b !== "(model root)" && links.includes(b)) ? b
+      : (cur && links.includes(cur)) ? cur : "";
+  }
+
   pill($("configured"), !!s.configured, "configured", "not configured");
   $("cfg-joints").textContent = (s.joints && s.joints.length)
     ? (s.joints.length + " (" + s.joints.join(", ") + ")") : "—";
@@ -109,9 +127,10 @@ async function doTrigger(enable) {
 async function doConfigure() {
   const link = $("link-select").value;
   const mode = $("mode-select").value;
+  const base = $("base-select").value;
   if (!link) { setMsg("pick a controlled link first"); return; }
   const out = await postJSON("/api/configure",
-    { controlled_frame: link, command_mode: mode });
+    { controlled_frame: link, command_mode: mode, base_frame: base });
   setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
   poll();
 }

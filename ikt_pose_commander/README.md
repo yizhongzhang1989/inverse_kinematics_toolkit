@@ -152,6 +152,11 @@ so the dashboard cannot bypass reachability / jump / speed limits. Default port
 
 **Subscribes**
 * `~/target_pose` (`geometry_msgs/PoseStamped`) — the target for `controlled_frame`.
+  `header.frame_id` may be any TF frame; an empty one is interpreted in
+  `base_frame`. Either way the target is transformed into the model root for the
+  solve. One-shot or streamed — a stream just retargets; it never interrupts the
+  robot (especially in `fpc` mode, where each target overwrites the setpoint).
+* `~/configure` (`std_msgs/String`, JSON) — unified runtime config (see below).
 * `/robot_description` (`std_msgs/String`, latched) — builds the kinematic model.
 * `/joint_states` (`sensor_msgs/JointState`) — IK seed + current pose.
 
@@ -167,15 +172,52 @@ so the dashboard cannot bypass reachability / jump / speed limits. Default port
 **Services offered**
 * `~/enable`, `~/disable`, `~/stop` (`std_srvs/Trigger`).
 
+### Runtime configuration (unified)
+
+Every config knob is set the **same** way at launch (a parameter) and at runtime
+— through **either** of two equivalent channels, both funnelling through one
+apply path:
+
+* `ros2 param set <ns> <key> <value>` — the standard ROS way.
+* `~/configure` (`std_msgs/String` carrying a JSON object of any subset of keys)
+  — used by the dashboard.
+
+Keys split by how they apply:
+
+* **Live** (take effect immediately, even while enabled): `base_frame`,
+  `max_joint_speed`, `min_move_time`, `max_step_rad`, `joint_states_stale_after`,
+  `joint_centering_weight`, `damping`, `tol_pos`, `tol_ori`, `max_iters`,
+  `default_stiffness`.
+* **Structural** (change the kinematic group / controllers; **refused while
+  enabled** — disable first): `controlled_frame`, `joints`, `jtc_controller`,
+  `fpc_controller`, `command_mode`. Naming only `controlled_frame` re-derives
+  `joints` + controllers automatically.
+
+```bash
+# set the controlled (target) link and the base reference link at runtime
+ros2 param set /ikt_pose_commander controlled_frame compliance_link
+ros2 param set /ikt_pose_commander base_frame base_link
+# or both at once over the unified topic
+ros2 topic pub --once /ikt_pose_commander/configure std_msgs/msg/String \
+  '{data: "{\"controlled_frame\": \"compliance_link\", \"base_frame\": \"base_link\", \"command_mode\": \"fpc\"}"}'
+```
+
+`base_frame` is the **default reference frame** a bare target (empty
+`header.frame_id`) is interpreted in; it is transformed to the model root for the
+solver, so any TF frame — a robot link or an external frame — is a valid base.
+
 The **dashboard** (`dashboard_node`, optional) is a separate node that consumes
-this API over HTTP/JSON; it adds no new robot-facing interface.
+this API over HTTP/JSON; it adds no new robot-facing interface. Its Configure
+card now also offers a **base-link** selector alongside the controlled-link one.
 
 ## Key parameters
 
 See [config/commander_defaults.yaml](config/commander_defaults.yaml). Most-used:
-`controlled_frame`, `joints`, `jtc_controller`, `fpc_controller`,
-`command_mode`, `default_stiffness` (per-DOF IK weighting — e.g. zero the last 3
-for position-only), `max_joint_speed`, `max_step_rad`, `start_enabled`.
+`controlled_frame` (the target link), `base_frame` (the target reference link),
+`joints`, `jtc_controller`, `fpc_controller`, `command_mode`, `default_stiffness`
+(per-DOF IK weighting — e.g. zero the last 3 for position-only),
+`max_joint_speed`, `max_step_rad`, `start_enabled`. All are settable at launch
+**and** at runtime (see *Runtime configuration* above).
 
 ## Relationship to the rest of the toolkit
 

@@ -63,7 +63,10 @@ def _defaults():
 def generate_launch_description():
     d, source = _defaults()
     args = [
-        DeclareLaunchArgument("instance_name", default_value="right"),
+        # Empty => single/default instance named ``ikt_pose_commander``.
+        # Override (e.g. ``left``/``right``) for multi-arm setups, which
+        # suffixes the node + dashboard namespace as ``ikt_pose_commander_<name>``.
+        DeclareLaunchArgument("instance_name", default_value=""),
         # Robot-specific: empty => start UNCONFIGURED, pick the link at runtime
         # (dashboard / ~/configure); joints + controllers are auto-derived.
         DeclareLaunchArgument("controlled_frame", default_value=""),
@@ -101,8 +104,9 @@ def generate_launch_description():
         package="ikt_pose_commander",
         executable="commander_node",
         name=PythonExpression(
-            ["'ikt_pose_commander_' + '",
-             LaunchConfiguration("instance_name"), "'"]),
+            ["'ikt_pose_commander' + ('_' + '",
+             LaunchConfiguration("instance_name"),
+             "' if '", LaunchConfiguration("instance_name"), "' else '')"]),
         output="screen",
         parameters=[{
             "controlled_frame": LaunchConfiguration("controlled_frame"),
@@ -131,8 +135,9 @@ def generate_launch_description():
         launch_arguments={
             "port": LaunchConfiguration("dashboard_port"),
             "commander_ns": PythonExpression(
-                ["'/ikt_pose_commander_' + '",
-                 LaunchConfiguration("instance_name"), "'"]),
+                ["'/ikt_pose_commander' + ('_' + '",
+                 LaunchConfiguration("instance_name"),
+                 "' if '", LaunchConfiguration("instance_name"), "' else '')"]),
             "base_frame": LaunchConfiguration("dashboard_base_frame"),
         }.items(),
         condition=IfCondition(PythonExpression(
