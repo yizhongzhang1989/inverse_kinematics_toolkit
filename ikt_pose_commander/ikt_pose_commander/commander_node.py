@@ -165,6 +165,12 @@ class PoseCommander(Node):
         self._enabled = False
         self._configured = False
         self._last_msg = "initialised (disabled, unconfigured)"
+        # Throttle repeated _set_msg logs: a high-rate target stream into a
+        # disabled/unconfigured commander would otherwise flood the log at the
+        # stream rate. We always update the status field, but only emit an INFO
+        # line when the message text changes or a heartbeat interval elapses.
+        self._last_logged_msg = ""
+        self._last_log_time = 0.0
         self._last_target_stamp = 0.0
         self._last_solution = None
         self._last_reason = ""
@@ -681,6 +687,13 @@ class PoseCommander(Node):
     def _set_msg(self, msg: str) -> None:
         with self._lock:
             self._last_msg = msg
+        # Dedupe + heartbeat-throttle: only log when the text changes or after a
+        # quiet interval, so a 50 Hz target stream doesn't spam the console.
+        now = time.monotonic()
+        if msg == self._last_logged_msg and (now - self._last_log_time) < 5.0:
+            return
+        self._last_logged_msg = msg
+        self._last_log_time = now
         self.get_logger().info("[commander] %s" % msg)
 
     def _publish_status(self) -> None:

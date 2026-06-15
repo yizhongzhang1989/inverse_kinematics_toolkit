@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """Optional web dashboard for ikt_pose_commander — a thin HTTP/ROS client.
 
-INDEPENDENT FROM THE CORE: this node imports no commander/IK internals. It talks
-to a running ``commander_node`` purely over its ROS API:
+It talks to a running ``commander_node`` over its ROS API (it does not import
+the commander's internals):
 
   * subscribes ``<ns>/status`` (JSON) for monitoring;
   * calls ``<ns>/enable`` / ``<ns>/disable`` (std_srvs/Trigger);
   * publishes ``<ns>/target_pose`` (geometry_msgs/PoseStamped) to command motion.
+
+It also renders a **3D canvas** (Three.js) showing the robot at the live
+``/joint_states`` configuration plus a triad at the **commanded target pose** —
+so a SpaceMouse / teleop stream can be visually checked. For that it builds its
+own Pinocchio model from ``/robot_description`` purely to compute per-link
+forward kinematics for rendering (same approach as the ikt_inverse_kinematics
+dashboard; this is the shared FK library, not commander internals), and it
+watches the same ``<ns>/target_pose`` topic it publishes to, so the marker
+tracks whatever source is driving the commander (its own jog/send OR the
+``spacemouse_servo`` bridge).
 
 It also keeps its own TF listener so it can *capture* the controlled frame's
 current pose and *jog* it (capture → offset one axis → publish). The commander
@@ -26,16 +36,21 @@ import json
 import mimetypes
 import threading
 import time
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional, Tuple
-from urllib.parse import urlparse
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
+import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy, qos_profile_sensor_data)
+from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -45,7 +60,103 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_TF = False
 
+try:
+    from ament_index_python.packages import get_package_share_directory
+except Exception:  # pragma: no cover
+    get_package_share_directory = None  # type: ignore
+
+# The 3D viewer builds a Pinocchio model purely to compute per-link forward
+# kinematics for rendering (same approach as the ikt_inverse_kinematics
+# dashboard). This is the shared FK library, not commander internals.
+try:
+    from ikt_core.robot_model import RobotModel
+    _RM_IMPORT_ERROR: Optional[str] = None
+except Exception as _exc:  # noqa: BLE001  pragma: no cover
+    RobotModel = None  # type: ignore
+    _RM_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
+
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _latched_qos() -> QoSProfile:
+    return QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                      reliability=ReliabilityPolicy.RELIABLE,
+                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
+
+
+def parse_visuals(urdf_xml: str) -> List[dict]:
+    """Extract ``<link><visual>`` mesh entries from a URDF string.
+
+    Returns ``[{link, filename, xyz, rpy, scale}]`` (mesh visuals only;
+    primitive-only links fall back to the skeleton view).
+    """
+    out: List[dict] = []
+    try:
+        root = ET.fromstring(urdf_xml)
+    except Exception:
+        return out
+    for link in root.findall("link"):
+        lname = link.get("name")
+        if not lname:
+            continue
+        for vis in link.findall("visual"):
+            geom = vis.find("geometry")
+            mesh = geom.find("mesh") if geom is not None else None
+            if mesh is None or not mesh.get("filename"):
+                continue
+            origin = vis.find("origin")
+            xyz = [0.0, 0.0, 0.0]
+            rpy = [0.0, 0.0, 0.0]
+            if origin is not None:
+                if origin.get("xyz"):
+                    xyz = [float(x) for x in origin.get("xyz").split()]
+                if origin.get("rpy"):
+                    rpy = [float(x) for x in origin.get("rpy").split()]
+            scale = [1.0, 1.0, 1.0]
+            if mesh.get("scale"):
+                scale = [float(x) for x in mesh.get("scale").split()]
+            out.append({"link": lname, "filename": mesh.get("filename"),
+                        "xyz": xyz, "rpy": rpy, "scale": scale})
+    return out
+
+
+def _quat_wxyz_to_R(q) -> np.ndarray:
+    w, x, y, z = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+    n = (w * w + x * x + y * y + z * z) ** 0.5
+    if n < 1e-12:
+        return np.eye(3)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _R_to_quat_wxyz(R) -> list:
+    R = np.asarray(R, dtype=float)
+    t = float(np.trace(R))
+    if t > 0:
+        s = 0.5 / np.sqrt(t + 1.0)
+        w, x, y, z = 0.25 / s, (R[2, 1] - R[1, 2]) * s, \
+            (R[0, 2] - R[2, 0]) * s, (R[1, 0] - R[0, 1]) * s
+    else:
+        i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+        if i == 0:
+            s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[0, 0] - R[1, 1] - R[2, 2]))
+            w, x = (R[2, 1] - R[1, 2]) / s, 0.25 * s
+            y, z = (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s
+        elif i == 1:
+            s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[1, 1] - R[0, 0] - R[2, 2]))
+            w, x = (R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s
+            y, z = 0.25 * s, (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(max(1e-12, 1.0 + R[2, 2] - R[0, 0] - R[1, 1]))
+            w, x = (R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s
+            y, z = (R[1, 2] + R[2, 1]) / s, 0.25 * s
+    q = np.array([w, x, y, z], dtype=float)
+    q /= (np.linalg.norm(q) or 1.0)
+    return [float(q[0]), float(q[1]), float(q[2]), float(q[3])]
 
 
 class CommanderDashboard(Node):
@@ -55,22 +166,50 @@ class CommanderDashboard(Node):
         self.declare_parameter("commander_ns", "/ikt_pose_commander_right")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("status_stale_after", 2.0)
+        self.declare_parameter("robot_description_topic", "/robot_description")
+        self.declare_parameter("joint_states_topic", "/joint_states")
 
         self._port = int(self.get_parameter("port").value)
         self._ns = str(self.get_parameter("commander_ns").value).rstrip("/")
         self._base_frame = str(self.get_parameter("base_frame").value)
         self._stale = float(self.get_parameter("status_stale_after").value)
+        self._desc_topic = str(self.get_parameter("robot_description_topic").value)
+        self._js_topic = str(self.get_parameter("joint_states_topic").value)
         self._host = "0.0.0.0"
 
         self._cbg = ReentrantCallbackGroup()
         self._lock = threading.Lock()
+        # Pinocchio FK mutates a shared data buffer; serialize FK calls.
+        self._fk_lock = threading.Lock()
         self._status: Optional[dict] = None
         self._status_stamp = 0.0
+        # 3D viewer state (robot model built from /robot_description)
+        self._urdf = ""
+        self._model: Optional["RobotModel"] = None
+        self._visuals: List[dict] = []
+        self._joint_pos: Dict[str, float] = {}
+        self._pkg_dirs: Dict[str, Optional[str]] = {}
+        # live commanded target (from <ns>/target_pose, incl. spacemouse_servo)
+        self._target: Optional[dict] = None
+        self._target_stamp = 0.0
 
         self.create_subscription(String, f"{self._ns}/status", self._on_status,
                                  10, callback_group=self._cbg)
+        self.create_subscription(String, self._desc_topic, self._on_urdf,
+                                 _latched_qos(), callback_group=self._cbg)
+        self.create_subscription(JointState, self._js_topic, self._on_js,
+                                 qos_profile_sensor_data, callback_group=self._cbg)
+        # Watch the same target topic we publish to, so the canvas shows the
+        # live target regardless of who sent it (this dashboard's jog/send OR
+        # the spacemouse_servo teleop bridge).
+        self.create_subscription(PoseStamped, f"{self._ns}/target_pose",
+                                 self._on_target, 10, callback_group=self._cbg)
         self._target_pub = self.create_publisher(
             PoseStamped, f"{self._ns}/target_pose", 10)
+        if _RM_IMPORT_ERROR is not None:
+            self.get_logger().warning(
+                "ikt_core.robot_model unavailable (%s) - 3D robot view "
+                "disabled; control panel still works." % _RM_IMPORT_ERROR)
         self._configure_pub = self.create_publisher(
             String, f"{self._ns}/configure", 10)
         self._cli_enable = self.create_client(
@@ -103,15 +242,148 @@ class CommanderDashboard(Node):
             self._status = s
             self._status_stamp = time.monotonic()
 
+    def _on_urdf(self, msg: String) -> None:
+        if not msg.data or RobotModel is None:
+            return
+        with self._lock:
+            if msg.data == self._urdf and self._model is not None:
+                return
+            self._urdf = msg.data
+        try:
+            model = RobotModel(msg.data)
+            vis = parse_visuals(msg.data)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error("failed to build model/visuals: %r" % exc)
+            return
+        with self._lock:
+            self._model = model
+            self._visuals = vis
+        self.get_logger().info(
+            "3D view: built model (%d DOF, %d links, %d mesh visuals)."
+            % (model.nq, len(model.link_frame_names()), len(vis)))
+
+    def _on_js(self, msg: JointState) -> None:
+        with self._lock:
+            for n, p in zip(msg.name, msg.position):
+                self._joint_pos[n] = float(p)
+
+    def _on_target(self, msg: PoseStamped) -> None:
+        p, o = msg.pose.position, msg.pose.orientation
+        with self._lock:
+            self._target = {
+                "xyz": [float(p.x), float(p.y), float(p.z)],
+                "quat": [float(o.w), float(o.x), float(o.y), float(o.z)],
+                "frame_id": msg.header.frame_id or self._base_frame,
+            }
+            self._target_stamp = time.monotonic()
+
+    # ------------------------------------------------------------------ #
+    # 3D viewer FK / mesh helpers (mirror the ikt_inverse_kinematics dashboard)
+    # ------------------------------------------------------------------ #
+    def _full_q(self, model: "RobotModel") -> np.ndarray:
+        q = model.neutral()
+        with self._lock:
+            jp = dict(self._joint_pos)
+        for jn in model.joint_names:
+            if jn in jp:
+                q[model.q_index(jn)] = jp[jn]
+        return q
+
+    def _mesh_url(self, filename: str) -> str:
+        if filename.startswith("package://"):
+            pkg, _, rel = filename[len("package://"):].partition("/")
+            return f"/mesh?pkg={quote(pkg)}&path={quote(rel)}"
+        if filename.startswith("file://"):
+            return f"/mesh?path={quote(filename[len('file://'):])}"
+        return f"/mesh?path={quote(filename)}"
+
+    def _package_dir(self, pkg: str) -> Optional[str]:
+        if pkg in self._pkg_dirs:
+            return self._pkg_dirs[pkg]
+        resolved = None
+        if get_package_share_directory is not None:
+            try:
+                resolved = get_package_share_directory(pkg)
+            except Exception:
+                resolved = None
+        self._pkg_dirs[pkg] = resolved
+        return resolved
+
+    def read_mesh(self, pkg: str, rel: str) -> Optional[bytes]:
+        rel = unquote(rel or "")
+        if pkg:
+            base = self._package_dir(unquote(pkg))
+            if base is None:
+                return None
+            path = Path(base) / rel
+        else:
+            path = Path(rel)
+        try:
+            return path.resolve().read_bytes()
+        except Exception:
+            return None
+
+    def _target_in_base(self) -> Optional[dict]:
+        """Live commanded target, expressed in the render (base) frame.
+
+        Transforms from the message's ``frame_id`` to ``base_frame`` via TF when
+        they differ (the common spacemouse_servo case already publishes in the
+        base frame, so this is usually identity).
+        """
+        with self._lock:
+            tgt = dict(self._target) if self._target else None
+            stamp = self._target_stamp
+        if tgt is None:
+            return None
+        xyz, quat, fid = tgt["xyz"], tgt["quat"], tgt["frame_id"]
+        transformed_from = None
+        if fid and fid != self._base_frame and self._tf_buffer is not None:
+            try:
+                tf = self._tf_buffer.lookup_transform(
+                    self._base_frame, fid, rclpy.time.Time())
+                t, r = tf.transform.translation, tf.transform.rotation
+                T = np.eye(4)
+                T[:3, :3] = _quat_wxyz_to_R([r.w, r.x, r.y, r.z])
+                T[:3, 3] = [t.x, t.y, t.z]
+                P = np.eye(4)
+                P[:3, :3] = _quat_wxyz_to_R(quat)
+                P[:3, 3] = xyz
+                M = T @ P
+                xyz = [float(M[0, 3]), float(M[1, 3]), float(M[2, 3])]
+                quat = _R_to_quat_wxyz(M[:3, :3])
+                transformed_from, fid = fid, self._base_frame
+            except Exception:
+                pass
+        age = time.monotonic() - stamp
+        return {"xyz": xyz, "quat": quat, "frame_id": fid,
+                "age": round(age, 2), "fresh": age <= self._stale,
+                "transformed_from": transformed_from}
+
     def snapshot(self) -> dict:
         with self._lock:
             s = self._status
             age = time.monotonic() - self._status_stamp if self._status_stamp \
                 else None
+            model = self._model
+            visuals = list(self._visuals)
         fresh = age is not None and age <= self._stale
-        return {"status": s, "fresh": fresh,
-                "age": round(age, 2) if age is not None else None,
-                "commander_ns": self._ns, "base_frame": self._base_frame}
+        out = {"status": s, "fresh": fresh,
+               "age": round(age, 2) if age is not None else None,
+               "commander_ns": self._ns, "base_frame": self._base_frame,
+               "target": self._target_in_base(), "has_model_viz": model is not None}
+        if model is not None:
+            q = self._full_q(model)
+            with self._fk_lock:
+                link_tf = model.all_link_transforms(q)
+            out["link_tf"] = link_tf
+            out["has_meshes"] = bool(visuals)
+            out["visuals"] = [
+                {"link": v["link"], "url": self._mesh_url(v["filename"]),
+                 "xyz": v["xyz"], "rpy": v["rpy"], "scale": v["scale"]}
+                for v in visuals]
+            out["skeleton"] = {k: [m[0][3], m[1][3], m[2][3]]
+                               for k, m in link_tf.items()}
+        return out
 
     def _controlled_frame(self) -> Optional[str]:
         with self._lock:
@@ -230,9 +502,25 @@ class CommanderDashboard(Node):
                     return self._serve_static("index.html")
                 if path == "/api/state":
                     return self._send(200, json.dumps(dash.snapshot()))
-                if path.startswith("/static/") or path.endswith(
+                if path == "/mesh":
+                    q = parse_qs(urlparse(self.path).query)
+                    data = dash.read_mesh((q.get("pkg") or [""])[0],
+                                          (q.get("path") or [""])[0])
+                    if data is None:
+                        return self._send(404, b'{"error":"mesh not found"}')
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if path.startswith("/static/"):
+                    return self._serve_static(path[len("/static/"):])
+                if path.startswith("/vendor/") or path.endswith(
                         (".css", ".js", ".html")):
-                    return self._serve_static(Path(path).name)
+                    return self._serve_static(path.lstrip("/"))
                 return self._send(404, '{"error":"not found"}')
 
             def do_POST(self):
@@ -267,11 +555,14 @@ class CommanderDashboard(Node):
                         dash.jog(b.get("axis", "x"), b.get("delta", 0.01))))
                 return self._send(404, '{"error":"not found"}')
 
-            def _serve_static(self, name):
-                fp = _STATIC_DIR / name
-                if not fp.is_file():
+            def _serve_static(self, relpath):
+                fp = (_STATIC_DIR / relpath).resolve()
+                if not str(fp).startswith(str(_STATIC_DIR.resolve())) \
+                        or not fp.is_file():
                     return self._send(404, "not found", "text/plain")
-                ctype = mimetypes.guess_type(str(fp))[0] or "text/plain"
+                ctype = mimetypes.guess_type(str(fp))[0] or "application/octet-stream"
+                if fp.suffix == ".js":
+                    ctype = "text/javascript"
                 return self._send(200, fp.read_bytes(), ctype)
 
         self._httpd = ThreadingHTTPServer((self._host, self._port), Handler)

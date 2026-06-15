@@ -3,28 +3,41 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ikt_pose_commander</title>
+  <title>ikt_pose_commander — 3D</title>
   <link rel="stylesheet" href="/static/dashboard.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/vendor/three.module.js",
+      "three/addons/": "/static/vendor/addons/"
+    }
+  }
+  </script>
 </head>
 <body>
-  <header>
-    <h1>ikt_pose_commander</h1>
-    <span id="conn" class="pill pill-bad">connecting…</span>
-  </header>
+  <!-- 3D viewer fills the area to the right of the panel -->
+  <div id="stage"><canvas id="viewer"></canvas></div>
+  <div id="loading"><div class="spinner"></div>Waiting for /robot_description…</div>
 
-  <main>
+  <div id="hud">
+    <button id="fit" class="btn sm" title="frame the robot">fit view</button>
+    <span id="tgt-read" class="muted">no target yet</span>
+    <span id="conn" class="pill pill-bad">connecting…</span>
+  </div>
+
+  <div id="panel">
+    <h1>Pose Commander <span class="muted">· 3D target view</span></h1>
+
     <!-- Configure (robot-independent: pick the link from the live URDF) -->
     <section class="card">
       <h2>Configure <span class="warn">(pick the link to control)</span></h2>
-      <div class="row">
-        <label>controlled link
-          <select id="link-select"><option value="">— loading from URDF —</option></select>
-        </label>
-        <label>mode
-          <select id="mode-select"><option value="jtc">jtc (safe)</option><option value="fpc">fpc (stream)</option></select>
-        </label>
-        <button id="btn-configure" class="btn btn-go">Configure</button>
-      </div>
+      <label>controlled link
+        <select id="link-select"><option value="">— loading from URDF —</option></select>
+      </label>
+      <label>mode
+        <select id="mode-select"><option value="jtc">jtc (safe)</option><option value="fpc">fpc (stream)</option></select>
+      </label>
+      <button id="btn-configure" class="btn btn-go">Configure</button>
       <div class="grid">
         <div class="stat"><span class="k">configured</span><span id="configured" class="v pill">—</span></div>
         <div class="stat"><span class="k">joints (auto)</span><span id="cfg-joints" class="v">—</span></div>
@@ -71,37 +84,33 @@
 
     <!-- Jog -->
     <section class="card">
-      <h2>Jog (capture current → offset → send)</h2>
-      <div class="row">
-        <label>step (m) <input id="jog-step" type="number" value="0.01" step="0.005" min="0.001" /></label>
-      </div>
+      <h2>Jog <span class="muted">(capture → offset → send)</span></h2>
+      <label>step (m) <input id="jog-step" type="number" value="0.01" step="0.005" min="0.001" /></label>
       <div class="jog">
-        <button class="btn" data-axis="x" data-sign="1">+X</button>
-        <button class="btn" data-axis="x" data-sign="-1">−X</button>
-        <button class="btn" data-axis="y" data-sign="1">+Y</button>
-        <button class="btn" data-axis="y" data-sign="-1">−Y</button>
-        <button class="btn" data-axis="z" data-sign="1">+Z</button>
-        <button class="btn" data-axis="z" data-sign="-1">−Z</button>
+        <button class="btn sm" data-axis="x" data-sign="1">+X</button>
+        <button class="btn sm" data-axis="x" data-sign="-1">−X</button>
+        <button class="btn sm" data-axis="y" data-sign="1">+Y</button>
+        <button class="btn sm" data-axis="y" data-sign="-1">−Y</button>
+        <button class="btn sm" data-axis="z" data-sign="1">+Z</button>
+        <button class="btn sm" data-axis="z" data-sign="-1">−Z</button>
       </div>
     </section>
 
     <!-- Target pose -->
     <section class="card">
-      <h2>Target pose</h2>
-      <div class="row">
+      <h2>Target pose <span class="muted">(green triad in 3D)</span></h2>
+      <div class="row3">
         <label>x <input id="tx" type="number" step="0.01" /></label>
         <label>y <input id="ty" type="number" step="0.01" /></label>
         <label>z <input id="tz" type="number" step="0.01" /></label>
       </div>
-      <div class="row">
+      <div class="row4">
         <label>qw <input id="qw" type="number" step="0.01" value="1" /></label>
         <label>qx <input id="qx" type="number" step="0.01" value="0" /></label>
         <label>qy <input id="qy" type="number" step="0.01" value="0" /></label>
         <label>qz <input id="qz" type="number" step="0.01" value="0" /></label>
       </div>
-      <div class="row">
-        <label>frame_id <input id="fid" type="text" placeholder="(base frame)" /></label>
-      </div>
+      <label>frame_id <input id="fid" type="text" placeholder="(base frame)" /></label>
       <div class="row">
         <button id="btn-capture" class="btn">Capture current</button>
         <button id="btn-send" class="btn btn-go">Send target</button>
@@ -109,8 +118,11 @@
     </section>
 
     <div class="msg" id="action-msg"></div>
-  </main>
+  </div>
 
+  <!-- control panel logic (classic script; unchanged API) -->
   <script src="/static/dashboard.js"></script>
+  <!-- 3D viewer (module): robot + live target triad -->
+  <script type="module" src="/static/viewer.js"></script>
 </body>
 </html>
