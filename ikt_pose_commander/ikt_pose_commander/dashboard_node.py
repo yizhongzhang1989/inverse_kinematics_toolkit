@@ -242,6 +242,8 @@ class CommanderDashboard(Node):
             Trigger, f"{self._ns}/enable", callback_group=self._cbg)
         self._cli_disable = self.create_client(
             Trigger, f"{self._ns}/disable", callback_group=self._cbg)
+        self._cli_return = self.create_client(
+            Trigger, f"{self._ns}/return_to_start", callback_group=self._cbg)
 
         if _HAVE_TF:
             self._tf_buffer = tf2_ros.Buffer()
@@ -446,18 +448,22 @@ class CommanderDashboard(Node):
     def configure(self, cfg: dict) -> dict:
         """Relay a config request to the commander's ``~/configure`` topic.
 
-        ``cfg`` needs at least ``controlled_frame``; joints + controllers are
-        auto-derived by the commander from the URDF + controller_manager.
+        Any subset of commander config keys is accepted (the commander
+        validates and applies them live or structurally). ``controlled_frame``
+        is only needed for the initial group setup; live tunables (stiffness
+        preset, allow_unreachable, speed/step limits, safety_radius_m,
+        control_rate_hz, tool offset, ...) can be sent on their own -> full
+        dashboard parity with the topic/param/service path.
         """
-        frame = (cfg or {}).get("controlled_frame")
-        if not frame:
-            return {"ok": False, "message": "need 'controlled_frame'"}
+        if not isinstance(cfg, dict) or not cfg:
+            return {"ok": False, "message": "empty config"}
         m = String()
         m.data = json.dumps(cfg)
         for _ in range(3):
             self._configure_pub.publish(m)
             time.sleep(0.02)
-        return {"ok": True, "message": f"configure sent (link={frame})"}
+        return {"ok": True,
+                "message": "configure sent (%s)" % ", ".join(sorted(cfg))}
 
     def call_trigger(self, enable: bool, timeout: float = 5.0) -> dict:
         cli = self._cli_enable if enable else self._cli_disable
@@ -472,9 +478,34 @@ class CommanderDashboard(Node):
         res = fut.result()
         return {"ok": bool(res.success), "message": res.message}
 
+    def call_return_to_start(self, timeout: float = 20.0) -> dict:
+        """Call the commander's ``~/return_to_start`` service (JTC move home)."""
+        if not self._cli_return.wait_for_service(timeout_sec=5.0):
+            return {"ok": False, "message": "return_to_start unavailable"}
+        fut = self._cli_return.call_async(Trigger.Request())
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "return_to_start timed out"}
+        res = fut.result()
+        return {"ok": bool(res.success), "message": res.message}
+
     def capture(self, timeout: float = 2.0
                 ) -> Tuple[Optional[list], Optional[list]]:
-        """Look up the controlled frame's current pose in base_frame."""
+        """Look up the controlled frame's current pose in base_frame.
+
+        When a tool offset is active the solve/tool tip is a virtual frame (not
+        in TF), so use the commander's reported tip pose (``current_ee`` /
+        ``current_ee_quat``) -> capture returns the TOOL pose.
+        """
+        with self._lock:
+            s = self._status or {}
+        solve_frame = s.get("solve_frame")
+        cf = s.get("controlled_frame")
+        if solve_frame and cf and solve_frame != cf:
+            ce, cq = s.get("current_ee"), s.get("current_ee_quat")
+            if ce and cq:
+                return list(ce), list(cq)
         frame = self._controlled_frame()
         if frame is None:
             return None, None
@@ -585,6 +616,9 @@ class CommanderDashboard(Node):
                     return self._send(200, json.dumps(dash.call_trigger(True)))
                 if path == "/api/disable":
                     return self._send(200, json.dumps(dash.call_trigger(False)))
+                if path == "/api/return_to_start":
+                    return self._send(200, json.dumps(
+                        dash.call_return_to_start()))
                 if path == "/api/capture":
                     xyz, quat = dash.capture()
                     if xyz is None:

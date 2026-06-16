@@ -147,13 +147,34 @@ ikt solve    --urdf /tmp/r.urdf --frame right_arm_Link7 --xyz 0.4 -0.2 0.9
 
 ## Using the result to move the robot
 
-The package is advisory; a *consumer* actuates. See
-[`test/closed_loop_demo.py`](test/closed_loop_demo.py) for a heavily-gated
-reference consumer that solves via `ik_node`, checks safety limits (reachable,
-bounded Cartesian move, bounded per-joint step, other arm untouched), then
-commands the existing `joint_trajectory_controller` and verifies the
-end-effector reached the target by FK. Validated on the mock robot (0.8 mm) and
-on the physical RM75 (≈4 mm, real servo accuracy).
+The package is advisory; a *consumer* actuates. The easy "solve → move" path is
+the **`solve_and_send`** CLI (commander **not** required):
+
+```bash
+# solve via ik_node and PRINT what would be sent (safe; default)
+ros2 run ikt_inverse_kinematics solve_and_send --frame link_6 \
+    --xyz 0.45 -0.03 0.68 --point
+
+# actually drive the controller (forward_position_controller must be active),
+# gated by the same 30 cm Cartesian check the commander uses:
+ros2 run ikt_inverse_kinematics solve_and_send --frame link_6 \
+    --xyz 0.45 -0.03 0.68 --point --apply --radius 0.30
+```
+
+It reads `/robot_description` + `/joint_states`, calls the `ik_node` typed
+service `<ik-ns>/solve`, prints the solution + diagnostics, applies the 30 cm
+Cartesian gate (FK of the solved config vs the current pose of `--frame`), and
+only with `--apply` publishes **one** `Float64MultiArray` to
+`/<controller>/commands`. Shares `ikt_core` with the commander, so the solver
+math is identical. Validated with the commander stopped on the mock and on the
+real Duco GCR5-910 (drove the FPC controller directly to the solved pose).
+
+For a more thorough, multi-gate reference consumer see
+[`test/closed_loop_demo.py`](test/closed_loop_demo.py): solves via `ik_node`,
+checks safety limits (reachable, bounded Cartesian move, bounded per-joint step,
+other arm untouched), commands the `joint_trajectory_controller`, and verifies
+the EE reached the target by FK. Validated on the mock (0.8 mm) and the physical
+RM75 (≈4 mm, real servo accuracy).
 
 ## Tests
 

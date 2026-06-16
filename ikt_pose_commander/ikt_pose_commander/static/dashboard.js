@@ -115,7 +115,36 @@ async function poll() {
     $("pos_err").textContent = (sv.max_pos_err * 1000).toFixed(2) + " mm";
     $("ori_err").textContent = (sv.max_ori_err).toFixed(4) + " rad";
   }
-}
+
+  // ---- Tracking (Phase 0/1/2/3) -----------------------------------------
+  $("solve_frame").textContent = s.solve_frame ?? "\u2014";
+  $("preset_v").textContent = s.stiffness_preset ?? "\u2014";
+  $("ee_disp").textContent = (s.ee_displacement ?? 0).toFixed(3) + " m";
+  $("safety_v").textContent = (s.safety_radius_m ?? 0).toFixed(2) + " m";
+  $("clamp_v").textContent = (s.clamp_scale ?? 1).toFixed(2);
+  pill($("best_effort"), !!s.best_effort, "best-effort", "no");
+  $("best_effort").className = "v pill " + (s.best_effort ? "pill-warn" : "");
+  $("control_v").textContent = (s.control_rate_hz ?? 0).toFixed(0) + " Hz";
+  const tox = s.tool_offset_xyz;
+  $("tool_v").textContent = tox
+    ? ("[" + tox.map((v) => v.toFixed(3)).join(", ") + "]") : "none";
+
+  // Populate the motion inputs ONCE from the live status, then never overwrite
+  // them (so a refresh tick never wipes what the user is typing).
+  if (!window._motionInit && s.configured) {
+    const setIf = (id, val) => {
+      if (val !== undefined && val !== null && $(id)) $(id).value = val;
+    };
+    setIf("safety-radius", s.safety_radius_m);
+    setIf("control-rate", s.control_rate_hz);
+    setIf("reach-gain", s.reach_gain);
+    setIf("max-speed", s.max_joint_speed);
+    setIf("min-time", s.min_move_time);
+    setIf("max-step-in", s.max_step_rad);
+    if (s.stiffness_preset) $("preset-select").value = s.stiffness_preset;
+    $("allow-unreach").checked = !!s.allow_unreachable;
+    window._motionInit = true;
+  }
 
 // ---- actions --------------------------------------------------------------
 async function doTrigger(enable) {
@@ -167,10 +196,60 @@ async function doJog(axis, sign) {
   setMsg(out.ok ? (out.message || "jogged") : ("jog failed: " + (out.message || "")));
 }
 
+async function doApplyMotion() {
+  const cfg = {
+    stiffness_preset: $("preset-select").value,
+    allow_unreachable: $("allow-unreach").checked,
+  };
+  const numIf = (id, key) => {
+    const v = parseFloat($(id).value);
+    if (!Number.isNaN(v)) cfg[key] = v;
+  };
+  numIf("safety-radius", "safety_radius_m");
+  numIf("control-rate", "control_rate_hz");
+  numIf("reach-gain", "reach_gain");
+  numIf("max-speed", "max_joint_speed");
+  numIf("min-time", "min_move_time");
+  numIf("max-step-in", "max_step_rad");
+  if ($("preset-select").value === "custom") {
+    const parts = ($("stiff6").value || "").trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 6 && parts.every((x) => !Number.isNaN(x))) {
+      cfg.default_stiffness = parts;
+    }
+  }
+  const out = await postJSON("/api/configure", cfg);
+  setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
+  poll();
+}
+
+async function doApplyTool() {
+  const xyz = [parseFloat($("tool-x").value), parseFloat($("tool-y").value),
+               parseFloat($("tool-z").value)];
+  const rpy = [parseFloat($("tool-r").value), parseFloat($("tool-p").value),
+               parseFloat($("tool-yw").value)];
+  if (xyz.some(Number.isNaN) || rpy.some(Number.isNaN)) {
+    setMsg("enter tool xyz/rpy (use 0 to clear)"); return;
+  }
+  const out = await postJSON("/api/configure",
+    { tool_offset_xyz: xyz, tool_offset_rpy: rpy });
+  setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
+  poll();
+}
+
+async function doReturn() {
+  setMsg("returning to start\u2026");
+  const out = await postJSON("/api/return_to_start", {});
+  setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
+  poll();
+}
+
 // ---- wire up --------------------------------------------------------------
 $("btn-configure").onclick = doConfigure;
 $("btn-enable").onclick = () => doTrigger(true);
 $("btn-disable").onclick = () => doTrigger(false);
+$("btn-return").onclick = doReturn;
+$("btn-apply-motion").onclick = doApplyMotion;
+$("btn-apply-tool").onclick = doApplyTool;
 $("btn-capture").onclick = doCapture;
 $("btn-send").onclick = doSend;
 document.querySelectorAll(".jog .btn").forEach((b) => {

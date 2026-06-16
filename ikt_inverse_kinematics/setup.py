@@ -46,6 +46,7 @@ setup(
             'ik_node = ikt_inverse_kinematics.ik_node:main',
             'dashboard_node = ikt_inverse_kinematics.dashboard_node:main',
             'marker_node = ikt_inverse_kinematics.marker_node:main',
+            'solve_and_send = ikt_inverse_kinematics.solve_and_send:main',
         ],
     },
 )

@@ -38,6 +38,10 @@ def main(argv=None) -> int:
     ap.add_argument("--capture", metavar="FRAME",
                     help="instead of --xyz, look up this frame's current pose "
                          "from /tf and send THAT (a no-op target)")
+    ap.add_argument("--offset", nargs=3, type=float, default=[0.0, 0.0, 0.0],
+                    metavar=("DX", "DY", "DZ"),
+                    help="add this XYZ offset (m, in the pose's frame) to the "
+                         "captured/explicit position before sending")
     args = ap.parse_args(argv)
 
     if not args.capture and not args.xyz:
@@ -73,12 +77,15 @@ def main(argv=None) -> int:
         t = tf.transform.translation
         r = tf.transform.rotation
         msg.header.frame_id = base
-        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = \
-            t.x, t.y, t.z
+        msg.pose.position.x = t.x + args.offset[0]
+        msg.pose.position.y = t.y + args.offset[1]
+        msg.pose.position.z = t.z + args.offset[2]
         msg.pose.orientation = r
     else:
         msg.header.frame_id = args.frame_id
-        msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = args.xyz
+        msg.pose.position.x = args.xyz[0] + args.offset[0]
+        msg.pose.position.y = args.xyz[1] + args.offset[1]
+        msg.pose.position.z = args.xyz[2] + args.offset[2]
         w, x, y, z = args.quat
         msg.pose.orientation.w = w
         msg.pose.orientation.x = x

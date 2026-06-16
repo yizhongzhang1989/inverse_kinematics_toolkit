@@ -67,12 +67,16 @@ except ImportError:  # pragma: no cover
 try:
     from ikt_core.robot_model import RobotModel
     from ikt_core import ik_core
-    from ikt_core.tasks import Task
+    from ikt_core.tasks import Task, VirtualFrame
+    from ikt_core.safety import clamp_config_to_sphere, frame_displacement
     _IK_IMPORT_ERROR: Optional[str] = None
 except Exception as _exc:  # noqa: BLE001  pragma: no cover
     RobotModel = None  # type: ignore
     ik_core = None  # type: ignore
     Task = None  # type: ignore
+    VirtualFrame = None  # type: ignore
+    clamp_config_to_sphere = None  # type: ignore
+    frame_displacement = None  # type: ignore
     _IK_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
@@ -94,11 +98,26 @@ _LIVE_KEYS = (
     "base_frame", "max_joint_speed", "min_move_time", "max_step_rad",
     "joint_states_stale_after", "joint_centering_weight", "damping",
     "tol_pos", "tol_ori", "max_iters", "default_stiffness",
+    "safety_radius_m", "allow_unreachable", "stiffness_preset", "reach_gain",
+    "control_rate_hz",
 )
 _STRUCTURAL_KEYS = (
     "controlled_frame", "joints", "jtc_controller", "fpc_controller",
-    "command_mode",
+    "command_mode", "tool_offset_xyz", "tool_offset_rpy", "tool_frame_name",
 )
+
+# Valid stiffness presets (Req 5: "how hard each DOF reaches the target").
+_STIFFNESS_PRESETS = ("full_pose", "position_only", "position_yaw", "custom")
+# FPC republish deadband: skip streaming a setpoint that is essentially the
+# previous one (anti-chatter, esp. best-effort holding at a joint limit).
+_FPC_DEADBAND_RAD = 1e-4
+# JTC re-command deadband: with a control loop, skip re-sending a trajectory
+# goal when the solved config is essentially unchanged (avoids goal spam /
+# restarting the same trajectory every tick).
+_JTC_DEADBAND_RAD = 1e-3
+# Hard cap on the control-loop rate. The effective FPC stream must stay within
+# the servoj input window (see duco_servoj_internals); 250 Hz is the ceiling.
+_CONTROL_RATE_MAX_HZ = 250.0
 
 
 class PoseCommander(Node):
@@ -126,12 +145,29 @@ class PoseCommander(Node):
         self.declare_parameter("jtc_controller", "")
         self.declare_parameter("fpc_controller", "")
         self.declare_parameter("command_mode", "jtc")          # jtc | fpc
+        # tool offset (Req 1): a virtual tool frame fixed to controlled_frame;
+        # targets then apply to this offset tip. Structural (rebuilds the IK
+        # model). All-zero offset = no tool (targets the control link itself).
+        self.declare_parameter("tool_offset_xyz", [0.0, 0.0, 0.0])
+        self.declare_parameter("tool_offset_rpy", [0.0, 0.0, 0.0])
+        self.declare_parameter("tool_frame_name", "ikt_tool")
         self.declare_parameter("start_enabled", False)         # SAFETY: off
         self.declare_parameter("switch_controllers", True)
         self.declare_parameter("controller_manager", "/controller_manager")
         # solver
         self.declare_parameter("default_stiffness",
                                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+        # stiffness preset (Req 5): full_pose | position_only | position_yaw |
+        # custom (custom uses the 6-vector default_stiffness above). "custom"
+        # keeps today's behaviour (use default_stiffness verbatim).
+        self.declare_parameter("stiffness_preset", "custom")
+        # best-effort reach (Req 5): when a target is unreachable, command the
+        # solver's closest config (still gated) instead of rejecting. OFF by
+        # default so existing behaviour is unchanged.
+        self.declare_parameter("allow_unreachable", False)
+        # FPC approach scaling in (0, 1]: command cur + reach_gain*(q_cmd-cur)
+        # for gradual, smoother stretching. 1.0 = full step (today's behaviour).
+        self.declare_parameter("reach_gain", 1.0)
         self.declare_parameter("joint_centering_weight", 1e-2)
         self.declare_parameter("damping", 1e-2)
         self.declare_parameter("tol_pos", 1e-3)
@@ -142,6 +178,14 @@ class PoseCommander(Node):
         self.declare_parameter("min_move_time", 0.5)           # s
         self.declare_parameter("max_step_rad", 0.8)            # jump reject
         self.declare_parameter("joint_states_stale_after", 0.5)  # s
+        # SAFETY: the controlled frame may not leave a sphere of this radius
+        # (metres) around the pose captured at ~/enable. Enforced in _on_target
+        # by the Cartesian gate; backed by tools/ikt_safety_watchdog.py.
+        self.declare_parameter("safety_radius_m", 0.30)
+        # control loop (Req 2): >0 Hz re-solves+commands the latest target on a
+        # timer (smooth FPC streaming / single-target tracking). 0 = pure
+        # event-driven (today's behaviour). Capped at _CONTROL_RATE_MAX_HZ.
+        self.declare_parameter("control_rate_hz", 0.0)
         self.declare_parameter("status_rate_hz", 10.0)
 
         gp = self.get_parameter
@@ -155,9 +199,24 @@ class PoseCommander(Node):
         self._jtc = str(gp("jtc_controller").value or "")
         self._fpc = str(gp("fpc_controller").value or "")
         self._mode = str(gp("command_mode").value).strip().lower()
+        # tool offset state (Req 1). _solve_frame is the frame IK actually
+        # targets: the tool tip when an offset is active, else the control link.
+        self._tool_frame_name = str(gp("tool_frame_name").value or "ikt_tool")
+        _txyz = self._parse3(gp("tool_offset_xyz").value)
+        _trpy = self._parse3(gp("tool_offset_rpy").value)
+        if _txyz is not None and (any(_txyz) or (_trpy and any(_trpy))):
+            self._tool_offset_xyz = _txyz
+            self._tool_offset_rpy = _trpy if _trpy is not None else [0.0, 0.0, 0.0]
+        else:
+            self._tool_offset_xyz = None
+            self._tool_offset_rpy = None
+        self._solve_frame = self._frame
         self._do_switch = bool(gp("switch_controllers").value)
         self._cm = str(gp("controller_manager").value or "/controller_manager")
         self._stiffness = [float(v) for v in gp("default_stiffness").value]
+        self._stiffness_preset = self._norm_preset(gp("stiffness_preset").value)
+        self._allow_unreachable = bool(gp("allow_unreachable").value)
+        self._reach_gain = min(1.0, max(1e-3, float(gp("reach_gain").value)))
         self._centering = float(gp("joint_centering_weight").value)
         self._damping = float(gp("damping").value)
         self._tol_pos = float(gp("tol_pos").value)
@@ -167,6 +226,9 @@ class PoseCommander(Node):
         self._min_time = max(0.0, float(gp("min_move_time").value))
         self._max_step = float(gp("max_step_rad").value)
         self._js_stale = float(gp("joint_states_stale_after").value)
+        self._safety_radius = max(0.0, float(gp("safety_radius_m").value))
+        self._control_rate = max(0.0, min(_CONTROL_RATE_MAX_HZ,
+                                          float(gp("control_rate_hz").value)))
         status_rate = max(0.5, float(gp("status_rate_hz").value))
 
         if self._mode not in ("jtc", "fpc"):
@@ -179,6 +241,10 @@ class PoseCommander(Node):
 
         # ---- state (guarded by _lock) -----------------------------------
         self._lock = threading.Lock()
+        # Serialises Pinocchio model.data access (solve + FK) across the
+        # event-driven target callback, the status timer, and the control-loop
+        # timer (Phase 3) -- they share one RobotModel.data and must not race.
+        self._fk_lock = threading.Lock()
         self._urdf = ""
         self._model: Optional[RobotModel] = None
         self._joint_pos: Dict[str, float] = {}
@@ -197,6 +263,20 @@ class PoseCommander(Node):
         self._last_reason = ""
         self._last_delta = 0.0
         self._goal_handle = None
+        # SAFETY (Phase 0): the motion envelope. On ~/enable we capture the
+        # measured joints + the controlled-frame position (FK) as the centre of
+        # the allowed sphere; the Cartesian gate keeps every command inside it.
+        self._start_q: Optional[Dict[str, float]] = None
+        self._start_ee_xyz: Optional[np.ndarray] = None
+        self._last_ee_disp = 0.0
+        self._last_clamp_scale = 1.0
+        self._last_fpc_cmd: Optional[List[float]] = None
+        self._last_best_effort = False
+        self._last_jtc_cmd: Optional[List[float]] = None
+        # control loop (Phase 3): latest resolved target + its timer
+        self._last_target = None              # (xyz, quat) in the solver frame
+        self._control_timer = None
+        self._control_timer_hz = 0.0
         # a pending config request (from launch params, ~/configure, or a staged
         # ``ros2 param set``) to apply once the model is available
         self._cfg_dirty = False
@@ -207,6 +287,10 @@ class PoseCommander(Node):
                              "jtc_controller": self._jtc or None,
                              "fpc_controller": self._fpc or None,
                              "command_mode": self._mode}
+            if self._tool_offset_xyz is not None:
+                self._req_cfg["tool_offset_xyz"] = self._tool_offset_xyz
+                self._req_cfg["tool_offset_rpy"] = self._tool_offset_rpy
+                self._req_cfg["tool_frame_name"] = self._tool_frame_name
 
         self._cbg = ReentrantCallbackGroup()
         cb = self._cbg
@@ -253,9 +337,14 @@ class PoseCommander(Node):
                             callback_group=cb)
         self.create_service(Trigger, "~/stop", self._srv_disable,
                             callback_group=cb)
+        self.create_service(Trigger, "~/return_to_start",
+                            self._srv_return_to_start, callback_group=cb)
 
         self.create_timer(1.0 / status_rate, self._publish_status,
                           callback_group=cb)
+        # start the control loop if a non-zero rate was set at launch
+        if self._control_rate > 0.0:
+            self._reconcile_control_timer()
 
         # Unified runtime config via standard parameters: ``ros2 param set``.
         # Live tunables apply at once; structural ones are staged and applied by
@@ -291,13 +380,12 @@ class PoseCommander(Node):
             self._urdf = msg.data
         if RobotModel is None:
             return
-        try:
-            model = RobotModel(msg.data)
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().error("failed to build model: %r" % exc)
+        ok, m = self._rebuild_model_from_urdf()
+        if not ok:
+            self.get_logger().error("failed to build model: %s" % m)
             return
         with self._lock:
-            self._model = model
+            model = self._model
         self.get_logger().info(
             "built kinematic model from /robot_description: %d DOF, %d links."
             % (model.nq, len(model.link_frame_names())))
@@ -311,6 +399,31 @@ class PoseCommander(Node):
         if self._want_enable:
             self._want_enable = False
             self._try_enable()
+
+    def _rebuild_model_from_urdf(self):
+        """(Re)build ``self._model`` from ``self._urdf``, re-applying any
+        configured tool offset so a URDF update preserves the virtual tool frame.
+        """
+        with self._lock:
+            urdf = self._urdf
+            frame = self._frame
+            xyz = self._tool_offset_xyz
+            rpy = self._tool_offset_rpy
+            name = self._tool_frame_name
+        if not urdf or RobotModel is None:
+            return False, "no robot_description"
+        vframes = []
+        if xyz is not None and frame:
+            vframes = [VirtualFrame(name, frame, tuple(xyz),
+                                    tuple(rpy or (0.0, 0.0, 0.0))).as_aux_frame()]
+        try:
+            model = (RobotModel(urdf, virtual_frames=vframes) if vframes
+                     else RobotModel(urdf))
+        except Exception as exc:  # noqa: BLE001
+            return False, "model build failed: %r" % exc
+        with self._lock:
+            self._model = model
+        return True, "ok"
 
     def _on_js(self, msg: JointState) -> None:
         now = time.monotonic()
@@ -410,6 +523,7 @@ class PoseCommander(Node):
         limits. Robust to string values (so JSON and typed params both work).
         """
         changed: List[str] = []
+        rate_changed = False
         with self._lock:
             for key, attr, lo in (
                 ("max_joint_speed", "_max_speed", 1e-3),
@@ -420,6 +534,7 @@ class PoseCommander(Node):
                 ("damping", "_damping", None),
                 ("tol_pos", "_tol_pos", None),
                 ("tol_ori", "_tol_ori", None),
+                ("safety_radius_m", "_safety_radius", 0.0),
             ):
                 if req.get(key) is None:
                     continue
@@ -445,50 +560,159 @@ class PoseCommander(Node):
                         changed.append("default_stiffness")
                 except (TypeError, ValueError):
                     pass
+            if req.get("stiffness_preset") is not None:
+                preset = self._norm_preset(req["stiffness_preset"])
+                self._stiffness_preset = preset
+                changed.append("stiffness_preset=%s" % preset)
+            if req.get("allow_unreachable") is not None:
+                self._allow_unreachable = self._as_bool(req["allow_unreachable"])
+                changed.append("allow_unreachable=%s" % self._allow_unreachable)
+            if req.get("reach_gain") is not None:
+                try:
+                    self._reach_gain = min(1.0, max(1e-3,
+                                                    float(req["reach_gain"])))
+                    changed.append("reach_gain=%g" % self._reach_gain)
+                except (TypeError, ValueError):
+                    pass
+            if req.get("control_rate_hz") is not None:
+                try:
+                    self._control_rate = max(0.0, min(
+                        _CONTROL_RATE_MAX_HZ, float(req["control_rate_hz"])))
+                    changed.append("control_rate_hz=%g" % self._control_rate)
+                    rate_changed = True
+                except (TypeError, ValueError):
+                    pass
             if "base_frame" in req and req["base_frame"] is not None:
                 self._base_frame = str(req["base_frame"] or "")
                 changed.append("base_frame=%s" % (self._base_frame or "(root)"))
+        if rate_changed:
+            self._reconcile_control_timer()
         return ", ".join(changed)
 
-    def _apply_structural(self, req: dict):
-        """Apply a kinematic-group / controller reconfig. Refused while enabled.
+    @staticmethod
+    def _norm_preset(value) -> str:
+        """Normalise a stiffness-preset value; unknowns fall back to 'custom'."""
+        s = str(value if value is not None else "custom").strip().lower()
+        return s if s in _STIFFNESS_PRESETS else "custom"
 
-        ``controlled_frame`` (or ``joints``) selects the group; when both are
-        omitted the current group is kept and only e.g. ``command_mode`` changes.
-        ``joints`` and the JTC/FPC controller names are optional; when omitted
-        they are derived from the model (joints = kinematic path to the link)
-        and from /controller_manager (controllers whose required command
-        interfaces cover those joints).
+    @staticmethod
+    def _as_bool(value) -> bool:
+        """Parse a bool from JSON bool/number or a string ('true'/'1'/'on')."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _reconcile_control_timer(self) -> None:
+        """Create/destroy/retune the control-loop timer to match _control_rate.
+
+        Called whenever ``control_rate_hz`` changes. The timer self-guards (does
+        nothing unless enabled + configured + a target exists), so it is safe to
+        run it whenever the rate is >0. Not called while holding ``_lock``.
+        """
+        with self._lock:
+            hz = self._control_rate
+            have = self._control_timer is not None
+            have_hz = self._control_timer_hz
+        want = hz > 0.0
+        if want and (not have or abs(have_hz - hz) > 1e-6):
+            if have and self._control_timer is not None:
+                self.destroy_timer(self._control_timer)
+            self._control_timer = self.create_timer(
+                1.0 / hz, self._control_tick, callback_group=self._cbg)
+            with self._lock:
+                self._control_timer_hz = hz
+        elif not want and have:
+            self.destroy_timer(self._control_timer)
+            self._control_timer = None
+            with self._lock:
+                self._control_timer_hz = 0.0
+
+    def _control_tick(self) -> None:
+        """Control-loop tick (Phase 3): re-solve + command the latest target.
+
+        Re-seeds from the CURRENT joints each tick so a single target keeps
+        being tracked and a slow target stream is upsampled into smooth FPC
+        streaming. The FPC/JTC deadbands stop redundant commands once converged.
+        """
+        with self._lock:
+            rate = self._control_rate
+            enabled = self._enabled
+            configured = self._configured
+            model = self._model
+            tgt = self._last_target
+        if rate <= 0.0 or not enabled or not configured or model is None:
+            return
+        if tgt is None or not self._js_fresh():
+            return
+        self._process_target(model, tgt[0], tgt[1])
+
+    def _apply_structural(self, req: dict):
+        """Apply a kinematic-group / controller / tool reconfig. Refused while
+        enabled.
+
+        Selects the control link (``controlled_frame``), derives the joints,
+        picks the JTC/FPC controllers, and — when a ``tool_offset_*`` is given —
+        rebuilds the IK model with a virtual tool frame fixed to the control
+        link and targets that offset tip. The user-facing ``controlled_frame``
+        stays the real link (for discovery); the solver targets ``solve_frame``.
+        ``joints`` and controller names are auto-derived when omitted.
         """
         with self._lock:
             if self._enabled:
                 return False, "refused: disable before reconfiguring"
-            model = self._model
+            urdf = self._urdf
             cur_frame, cur_joints = self._frame, list(self._joints)
             cur_jtc, cur_fpc, cur_mode = self._jtc, self._fpc, self._mode
             cur_configured = self._configured
-        if model is None:
+            cur_tool = self._tool_tuple_locked()
+        if not urdf or RobotModel is None:
             return False, "no model yet"
 
         changing_group = ("controlled_frame" in req) or ("joints" in req)
         if changing_group:
             frame = str(req.get("controlled_frame") or cur_frame or "")
-            if not frame or not model.has_frame(frame):
-                return False, f"unknown link/frame '{frame}'"
-            joints = req.get("joints")
-            if joints:
-                joints = [str(j) for j in joints if str(j)]
-                missing = [j for j in joints if j not in model.joint_names]
-                if missing:
-                    return False, f"joints not in URDF: {missing}"
-            else:
-                joints = model.supporting_joints(frame)
-                if not joints:
-                    return False, f"no movable joints support frame '{frame}'"
         else:
             if not cur_configured:
                 return False, "not configured; set controlled_frame first"
-            frame, joints = cur_frame, cur_joints
+            frame = cur_frame
+        if not frame:
+            return False, "controlled_frame required"
+
+        # tool offset (Req 1): merge request over current state
+        tool, terr = self._resolve_tool_offset(req, cur_tool)
+        if terr:
+            return False, terr
+
+        # build the desired model (with the tool virtual frame if active)
+        vframes = []
+        if tool is not None:
+            vframes = [VirtualFrame(tool[2], frame, tuple(tool[0]),
+                                    tuple(tool[1])).as_aux_frame()]
+        try:
+            model = (RobotModel(urdf, virtual_frames=vframes) if vframes
+                     else RobotModel(urdf))
+        except Exception as exc:  # noqa: BLE001
+            return False, "model build failed (tool offset?): %r" % exc
+        if not model.has_frame(frame):
+            return False, f"unknown link/frame '{frame}'"
+        if tool is not None and not model.has_frame(tool[2]):
+            return False, f"tool frame '{tool[2]}' not created"
+
+        # joints: explicit > derived from the PARENT control link > kept
+        joints = req.get("joints")
+        if joints:
+            joints = [str(j) for j in joints if str(j)]
+            missing = [j for j in joints if j not in model.joint_names]
+            if missing:
+                return False, f"joints not in URDF: {missing}"
+        elif changing_group or not cur_joints:
+            joints = model.supporting_joints(frame)
+            if not joints:
+                return False, f"no movable joints support frame '{frame}'"
+        else:
+            joints = cur_joints
 
         mode = str(req.get("command_mode") or cur_mode).strip().lower()
         if mode not in ("jtc", "fpc"):
@@ -504,7 +728,6 @@ class PoseCommander(Node):
             disc = self._discover_controllers(joints)
             jtc = jtc or disc.get("jtc", "")
             fpc = fpc or disc.get("fpc", "")
-        # the controller for the ACTIVE mode must be known; the other is optional
         if mode == "jtc" and not jtc:
             return False, ("no JointTrajectoryController found driving %s; "
                            "set jtc_controller explicitly" % joints)
@@ -512,13 +735,64 @@ class PoseCommander(Node):
             return False, ("no ForwardCommandController found driving %s; "
                            "set fpc_controller explicitly" % joints)
 
+        solve_frame = tool[2] if tool is not None else frame
         with self._lock:
+            self._model = model
             self._frame, self._joints = frame, joints
+            self._solve_frame = solve_frame
+            self._tool_offset_xyz = list(tool[0]) if tool else None
+            self._tool_offset_rpy = list(tool[1]) if tool else None
+            if tool:
+                self._tool_frame_name = tool[2]
             self._jtc, self._fpc, self._mode = jtc, fpc, mode
             self._configured = True
         self._rebuild_clients()
-        return True, (f"link={frame} joints={len(joints)} mode={mode} "
-                      f"jtc={jtc or '-'} fpc={fpc or '-'}")
+        tool_msg = ""
+        if tool is not None:
+            tool_msg = " tool=%s xyz=%s" % (solve_frame, list(tool[0]))
+        return True, (f"link={frame} solve={solve_frame} joints={len(joints)} "
+                      f"mode={mode} jtc={jtc or '-'} fpc={fpc or '-'}{tool_msg}")
+
+    def _tool_tuple_locked(self):
+        """Current tool as ``(xyz, rpy, name)`` or ``None``. Caller holds _lock."""
+        if self._tool_offset_xyz is None:
+            return None
+        return (list(self._tool_offset_xyz),
+                list(self._tool_offset_rpy or [0.0, 0.0, 0.0]),
+                self._tool_frame_name)
+
+    def _resolve_tool_offset(self, req: dict, cur_tool):
+        """Merge tool keys in ``req`` over ``cur_tool``.
+
+        Returns ``(tool, err)`` where ``tool`` is ``(xyz, rpy, name)`` or
+        ``None`` (no/cleared offset; an all-zero offset clears it). ``err`` is a
+        non-empty string on a parse error.
+        """
+        keys = ("tool_offset_xyz", "tool_offset_rpy", "tool_frame_name")
+        if not any(k in req for k in keys):
+            return cur_tool, ""
+        cxyz = list(cur_tool[0]) if cur_tool else [0.0, 0.0, 0.0]
+        crpy = list(cur_tool[1]) if cur_tool else [0.0, 0.0, 0.0]
+        cname = cur_tool[2] if cur_tool else self._tool_frame_name
+        xyz = self._parse3(req["tool_offset_xyz"]) if "tool_offset_xyz" in req \
+            else cxyz
+        rpy = self._parse3(req["tool_offset_rpy"]) if "tool_offset_rpy" in req \
+            else crpy
+        if xyz is None or rpy is None:
+            return None, "tool_offset_xyz/rpy must each be 3 numbers"
+        name = str(req.get("tool_frame_name") or cname or "ikt_tool")
+        if not any(xyz) and not any(rpy):
+            return None, ""  # cleared back to no offset
+        return (xyz, rpy, name), ""
+
+    @staticmethod
+    def _parse3(v):
+        """Parse a 3-vector of floats; return a list[3] or None."""
+        try:
+            out = [float(x) for x in v]
+        except (TypeError, ValueError):
+            return None
+        return out if len(out) == 3 else None
 
     def _discover_controllers(self, joints) -> dict:
         """Find JTC + FPC controllers whose command interfaces cover ``joints``.
@@ -589,6 +863,7 @@ class PoseCommander(Node):
             enabled = self._enabled
             model = self._model
             configured = self._configured
+            rate = self._control_rate
         if not configured:
             self._set_msg("target ignored: UNCONFIGURED (set the link via "
                           "~/configure or the dashboard)")
@@ -608,18 +883,57 @@ class PoseCommander(Node):
             self._set_msg("target ignored: TF transform unavailable")
             return
 
+        # Store the latest target. With a control loop (control_rate_hz>0) the
+        # timer re-solves/commands it; otherwise process it now (event-driven).
+        with self._lock:
+            self._last_target = (xyz, quat)
+        if rate <= 0.0:
+            self._process_target(model, xyz, quat)
+
+    def _process_target(self, model, xyz, quat) -> None:
+        """Solve IK for one target and command it through the safety gates.
+
+        Shared by the event-driven path (``_on_target``) and the control-loop
+        timer (``_control_tick``). Re-seeds from the current joints each call.
+        """
         seed = self._build_seed(model)
         sol = self._solve(model, seed, xyz, quat)
         with self._lock:
             self._last_solution = sol
             self._last_reason = sol.reason.value
+            allow = self._allow_unreachable
 
+        best_effort = False
         if not sol.reachable:
-            self._set_msg("target REJECTED: unreachable (%s)" % sol.reason.value)
+            if not allow:
+                with self._lock:
+                    self._last_best_effort = False
+                self._set_msg(
+                    "target REJECTED: unreachable (%s)" % sol.reason.value)
+                return
+            # best-effort (Req 5): command the solver's closest config (arm
+            # stretches toward the target). Still bounded by the max_step gate
+            # and the Phase-0 Cartesian gate below. Status keeps reachable=false.
+            best_effort = True
+        with self._lock:
+            self._last_best_effort = best_effort
+
+        # Commanded full configuration (active joints solved; the rest frozen at
+        # the seed). The Cartesian safety gate and jump protection both act on
+        # this BEFORE anything is sent to a controller.
+        q_full = np.asarray(sol.q, dtype=float)
+
+        # --- Cartesian safety gate (Phase 0) -----------------------------
+        # Keep the controlled frame inside the sphere captured at ~/enable.
+        # JTC rejects an out-of-sphere target; FPC clamps the joint step so the
+        # frame lands on the boundary. Independent of reachability.
+        ok, q_full, gate_msg = self._apply_cartesian_gate(model, seed, q_full)
+        if not ok:
+            self._set_msg(gate_msg)
             return
 
         # jump protection: max joint change over the CONTROLLED joints vs current
-        q_cmd = {j: float(sol.q[model.q_index(j)]) for j in self._joints}
+        q_cmd = {j: float(q_full[model.q_index(j)]) for j in self._joints}
         with self._lock:
             cur = {j: self._joint_pos.get(j) for j in self._joints}
         if any(cur[j] is None for j in self._joints):
@@ -635,9 +949,52 @@ class PoseCommander(Node):
             return
 
         if self._mode == "jtc":
-            self._command_jtc(q_cmd, max_delta)
+            self._command_jtc(q_cmd, max_delta, best_effort)
         else:
-            self._command_fpc(q_cmd)
+            self._command_fpc(q_cmd, best_effort)
+
+    def _apply_cartesian_gate(self, model, seed, q_full):
+        """Enforce the 30 cm Cartesian envelope on the controlled frame.
+
+        Returns ``(ok, q_out, reject_msg)``. With no start pose captured or a
+        non-positive radius it is a no-op. Within the sphere it passes the
+        configuration through. Outside: JTC returns ``ok=False`` (reject); FPC
+        clamps the joint step so the frame lands on the boundary and returns the
+        scaled configuration. Updates ``_last_ee_disp`` / ``_last_clamp_scale``
+        for status either way.
+        """
+        with self._lock:
+            start = self._start_ee_xyz
+            radius = self._safety_radius
+            frame = self._solve_frame
+            mode = self._mode
+        if start is None or radius <= 0.0 or frame_displacement is None:
+            return True, q_full, ""
+        with self._fk_lock:
+            d = frame_displacement(model, q_full, frame, start)
+        if d <= radius:
+            with self._lock:
+                self._last_ee_disp = d
+                self._last_clamp_scale = 1.0
+            return True, q_full, ""
+        if mode == "jtc":
+            with self._lock:
+                self._last_ee_disp = d
+                self._last_clamp_scale = 0.0
+            return False, q_full, (
+                "target REJECTED: EE %.3f m exceeds safety_radius_m %.3f "
+                "(30 cm envelope)" % (d, radius))
+        # fpc: clamp the step toward the sphere boundary
+        with self._fk_lock:
+            q_out, scale, d_cl = clamp_config_to_sphere(
+                model, seed, q_full, frame, start, radius)
+        with self._lock:
+            self._last_ee_disp = d_cl
+            self._last_clamp_scale = scale
+        self.get_logger().warn(
+            "[commander] EE clamp: %.3f -> %.3f m (scale %.2f, radius %.2f)"
+            % (d, d_cl, scale, radius))
+        return True, q_out, ""
 
     def _build_seed(self, model: "RobotModel") -> np.ndarray:
         q = model.neutral()
@@ -653,10 +1010,33 @@ class PoseCommander(Node):
             max_iters=self._max_iters, tol_pos=self._tol_pos,
             tol_ori=self._tol_ori, damping=self._damping,
             joint_centering_weight=self._centering)
-        task = Task(self._frame, tuple(float(v) for v in xyz),
-                    tuple(float(v) for v in quat), tuple(self._stiffness))
-        return ik_core.solve(model, seed, [task], params=params,
-                             active_joints=self._joints)
+        task = self._build_task(xyz, quat)
+        with self._fk_lock:
+            return ik_core.solve(model, seed, [task], params=params,
+                                 active_joints=self._joints)
+
+    def _build_task(self, xyz, quat):
+        """Build the IK Task per the active stiffness preset (Req 5).
+
+        ``full_pose`` -> all 6 DOF; ``position_only`` -> orientation free;
+        ``position_yaw`` -> position + yaw (pitch/roll free); ``custom`` -> the
+        6-vector ``default_stiffness``. This is the easy knob for *how hard each
+        DOF reaches the target* (e.g. position_only reaches the point even when
+        orientation can't be matched).
+        """
+        with self._lock:
+            frame = self._solve_frame
+            preset = self._stiffness_preset
+            stiff = tuple(self._stiffness)
+        xyz_t = tuple(float(v) for v in xyz)
+        quat_t = tuple(float(v) for v in quat)
+        if preset == "full_pose":
+            return Task.pose(frame, xyz_t, quat_t)
+        if preset == "position_only":
+            return Task.point(frame, xyz_t)
+        if preset == "position_yaw":
+            return Task.position_yaw(frame, xyz_t, quat_t)
+        return Task(frame, xyz_t, quat_t, stiff)
 
     def _resolve_pose(self, msg: PoseStamped):
         """Return (xyz, quat_wxyz) for the target expressed in the SOLVER frame
@@ -711,9 +1091,20 @@ class PoseCommander(Node):
     # ------------------------------------------------------------------ #
     # Commanding
     # ------------------------------------------------------------------ #
-    def _command_jtc(self, q_cmd: Dict[str, float], max_delta: float) -> None:
+    def _command_jtc(self, q_cmd: Dict[str, float], max_delta: float,
+                     best_effort: bool = False) -> None:
         if self._jtc_client is None:
             self._set_msg("cannot command: FollowJointTrajectory unavailable")
+            return
+        data = [float(q_cmd[j]) for j in self._joints]
+        # Deadband (control-loop only): don't re-send a goal for an unchanged
+        # solved config (would restart the same trajectory every tick). In
+        # event-driven mode every target is intentional, so always send.
+        with self._lock:
+            last = self._last_jtc_cmd
+            rate = self._control_rate
+        if rate > 0.0 and last is not None and len(last) == len(data) and \
+                max(abs(a - b) for a, b in zip(data, last)) < _JTC_DEADBAND_RAD:
             return
         if not self._jtc_client.server_is_ready():
             self._jtc_client.wait_for_server(timeout_sec=1.0)
@@ -721,11 +1112,13 @@ class PoseCommander(Node):
             self._set_msg("cannot command: %s action server not ready"
                           % self._jtc)
             return
+        with self._lock:
+            self._last_jtc_cmd = data
         duration = max(self._min_time, max_delta / self._max_speed)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = list(self._joints)
         pt = JointTrajectoryPoint()
-        pt.positions = [q_cmd[j] for j in self._joints]
+        pt.positions = data
         pt.time_from_start.sec = int(duration)
         pt.time_from_start.nanosec = int((duration % 1.0) * 1e9)
         goal.trajectory.points = [pt]
@@ -743,14 +1136,37 @@ class PoseCommander(Node):
             with self._lock:
                 self._goal_handle = handle
         fut.add_done_callback(_on_resp)
-        self._set_msg("JTC move sent (%.2fs, step %.3f rad)"
-                      % (duration, max_delta))
+        self._set_msg("JTC move sent (%.2fs, step %.3f rad)%s"
+                      % (duration, max_delta,
+                         " [best-effort]" if best_effort else ""))
 
-    def _command_fpc(self, q_cmd: Dict[str, float]) -> None:
+    def _command_fpc(self, q_cmd: Dict[str, float],
+                     best_effort: bool = False) -> None:
+        with self._lock:
+            cur = {j: self._joint_pos.get(j) for j in self._joints}
+            gain = self._reach_gain
+            last = self._last_fpc_cmd
+            rate = self._control_rate
+        # Approach scaling (Req 5): a gradual step toward the target per cycle
+        # for smoother stretching. gain=1.0 (default) sends the full step.
+        if 0.0 < gain < 1.0 and all(cur[j] is not None for j in self._joints):
+            data = [float(cur[j] + gain * (q_cmd[j] - cur[j]))
+                    for j in self._joints]
+        else:
+            data = [float(q_cmd[j]) for j in self._joints]
+        # Deadband: in EVENT-DRIVEN mode skip republishing an unchanged setpoint
+        # (anti-chatter; the controller latches it). Under a control loop
+        # (rate>0) keep streaming so the FPC input stays fed at the loop rate.
+        if rate <= 0.0 and last is not None and len(last) == len(data) and \
+                max(abs(a - b) for a, b in zip(data, last)) < _FPC_DEADBAND_RAD:
+            return
+        with self._lock:
+            self._last_fpc_cmd = data
         m = Float64MultiArray()
-        m.data = [q_cmd[j] for j in self._joints]
+        m.data = data
         self._fpc_pub.publish(m)
-        self._set_msg("FPC command streamed")
+        self._set_msg("FPC command streamed%s"
+                      % (" [best-effort]" if best_effort else ""))
 
     # ------------------------------------------------------------------ #
     # Enable / disable (controller switching)
@@ -766,6 +1182,7 @@ class PoseCommander(Node):
             model = self._model
             configured = self._configured
             mode, jtc, fpc = self._mode, self._jtc, self._fpc
+            solve_frame, joints = self._solve_frame, list(self._joints)
         if not configured:
             return False, ("unconfigured; name the link to control via "
                            "~/configure or the dashboard first")
@@ -785,14 +1202,36 @@ class PoseCommander(Node):
             deact = [other] if other else []
             if not self._switch(activate=[want], deactivate=deact):
                 return False, self._last_msg or "controller switch failed"
+        # SAFETY (Phase 0): capture the start pose = centre of the 30 cm motion
+        # envelope. Record the measured joints (for return-to-start) and the
+        # SOLVE frame's position via FK (the tool tip when an offset is active).
+        seed = self._build_seed(model)
+        try:
+            with self._fk_lock:
+                start_xyz, _ = model.fk(seed, solve_frame)
+        except Exception as exc:  # noqa: BLE001
+            return False, "cannot enable: FK of start pose failed (%r)" % exc
         with self._lock:
             self._enabled = True
-        self._set_msg("ENABLED (mode=%s, controller=%s)" % (mode, want))
+            self._start_q = {j: float(seed[model.q_index(j)]) for j in joints}
+            self._start_ee_xyz = np.asarray(start_xyz, dtype=float)
+            self._last_ee_disp = 0.0
+            self._last_clamp_scale = 1.0
+            self._last_fpc_cmd = None
+            self._last_jtc_cmd = None
+            self._last_target = None
+            self._last_best_effort = False
+        self._set_msg(
+            "ENABLED (mode=%s, controller=%s); start EE [%.3f %.3f %.3f] m, "
+            "safety_radius=%.2f m" % (mode, want, float(start_xyz[0]),
+                                      float(start_xyz[1]), float(start_xyz[2]),
+                                      self._safety_radius))
         return True, "enabled"
 
     def _srv_disable(self, request, response):
         with self._lock:
             self._enabled = False
+            self._last_target = None
             mode, jtc, fpc = self._mode, self._jtc, self._fpc
         # Return to JTC, which holds the current pose.
         if self._do_switch and mode == "fpc" and jtc and fpc:
@@ -820,6 +1259,89 @@ class PoseCommander(Node):
         m = Float64MultiArray()
         m.data = [float(cur[j]) for j in self._joints]
         pub.publish(m)
+
+    def _srv_return_to_start(self, request, response):
+        ok, msg = self._return_to_start()
+        response.success = ok
+        response.message = msg
+        return response
+
+    def _return_to_start(self, timeout: float = 20.0):
+        """Command a JTC move back to the pose captured at ~/enable and wait.
+
+        SAFETY (Phase 0): used at the end of every test to bring the arm home.
+        Always moves via the trajectory controller (activating it first if the
+        active mode is FPC), so it works regardless of the command mode. Blocks
+        on the goal result up to ``timeout`` and reports completion.
+        """
+        with self._lock:
+            model = self._model
+            configured = self._configured
+            start_q = dict(self._start_q) if self._start_q else None
+            joints = list(self._joints)
+            jtc, fpc, mode = self._jtc, self._fpc, self._mode
+            do_switch = self._do_switch
+        if start_q is None:
+            return False, "no start pose captured; enable first"
+        if model is None or not configured:
+            return False, "not configured"
+        if not self._js_fresh():
+            return False, "/joint_states stale; cannot return to start"
+        if not _HAS_FJT or self._jtc_client is None:
+            return False, "JTC action client unavailable"
+        # Ensure the trajectory controller is active (return-to-start is a JTC
+        # move even for FPC tests).
+        if do_switch:
+            deact = [fpc] if (mode == "fpc" and fpc) else []
+            if not self._switch(activate=[jtc], deactivate=deact):
+                return False, "failed to activate JTC for return-to-start"
+        if not self._jtc_client.server_is_ready():
+            self._jtc_client.wait_for_server(timeout_sec=2.0)
+        if not self._jtc_client.server_is_ready():
+            return False, "JTC action server not ready"
+        with self._lock:
+            cur = {j: self._joint_pos.get(j) for j in joints}
+        if any(cur[j] is None for j in joints):
+            return False, "current joint pos unknown"
+        max_delta = max(abs(start_q[j] - cur[j]) for j in joints)
+        duration = max(self._min_time, max_delta / self._max_speed)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(joints)
+        pt = JointTrajectoryPoint()
+        pt.positions = [start_q[j] for j in joints]
+        pt.time_from_start.sec = int(duration)
+        pt.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+        goal.trajectory.points = [pt]
+
+        done = threading.Event()
+        state: Dict[str, object] = {}
+
+        def _on_result(_f):
+            state["done_result"] = True
+            done.set()
+
+        def _on_goal(f):
+            try:
+                handle = f.result()
+            except Exception as exc:  # noqa: BLE001
+                state["err"] = "goal error: %r" % exc
+                done.set()
+                return
+            if handle is None or not handle.accepted:
+                state["err"] = "JTC goal rejected"
+                done.set()
+                return
+            with self._lock:
+                self._goal_handle = handle
+            handle.get_result_async().add_done_callback(_on_result)
+
+        self._jtc_client.send_goal_async(goal).add_done_callback(_on_goal)
+        if not done.wait(timeout=timeout):
+            return False, "return-to-start timed out after %.1fs" % timeout
+        if "err" in state:
+            return False, str(state["err"])
+        self._set_msg("returned to start pose (%.2fs move)" % duration)
+        return True, "returned to start"
 
     def _switch(self, activate: List[str], deactivate: List[str]) -> bool:
         if not _HAS_CM or self._cli_switch is None:
@@ -886,6 +1408,35 @@ class PoseCommander(Node):
             reason = self._last_reason
             frame, joints = self._frame, list(self._joints)
             jtc, fpc, mode = self._jtc, self._fpc, self._mode
+            safety_radius = self._safety_radius
+            control_rate = self._control_rate
+            start_ee = (self._start_ee_xyz.tolist()
+                        if self._start_ee_xyz is not None else None)
+            ee_disp = self._last_ee_disp
+            clamp_scale = self._last_clamp_scale
+            allow_unreachable = self._allow_unreachable
+            stiffness_preset = self._stiffness_preset
+            reach_gain = self._reach_gain
+            best_effort = self._last_best_effort
+            solve_frame = self._solve_frame
+            tool_xyz = (list(self._tool_offset_xyz)
+                        if self._tool_offset_xyz is not None else None)
+            tool_rpy = (list(self._tool_offset_rpy)
+                        if self._tool_offset_rpy is not None else None)
+            tool_name = self._tool_frame_name
+        # Current SOLVE-frame (tool tip) position via FK, so the dashboard's
+        # "capture current" returns the tool pose when an offset is active.
+        current_ee = None
+        current_ee_quat = None
+        if model is not None and configured and solve_frame and self._js_fresh():
+            try:
+                seed_now = self._build_seed(model)
+                with self._fk_lock:
+                    cee, ceq = model.fk(seed_now, solve_frame)
+                current_ee = [float(v) for v in cee]
+                current_ee_quat = [float(v) for v in ceq]
+            except Exception:  # noqa: BLE001
+                current_ee = None
         status = {
             "enabled": enabled,
             "configured": configured,
@@ -901,6 +1452,23 @@ class PoseCommander(Node):
             "last_reason": reason,
             "last_step_rad": delta,
             "max_step_rad": self._max_step,
+            "max_joint_speed": self._max_speed,
+            "min_move_time": self._min_time,
+            "safety_radius_m": safety_radius,
+            "control_rate_hz": control_rate,
+            "start_ee": start_ee,
+            "ee_displacement": ee_disp,
+            "clamp_scale": clamp_scale,
+            "allow_unreachable": allow_unreachable,
+            "stiffness_preset": stiffness_preset,
+            "reach_gain": reach_gain,
+            "best_effort": best_effort,
+            "solve_frame": solve_frame,
+            "tool_offset_xyz": tool_xyz,
+            "tool_offset_rpy": tool_rpy,
+            "tool_frame_name": tool_name,
+            "current_ee": current_ee,
+            "current_ee_quat": current_ee_quat,
             "commands_robot": True,
         }
         if model is not None:

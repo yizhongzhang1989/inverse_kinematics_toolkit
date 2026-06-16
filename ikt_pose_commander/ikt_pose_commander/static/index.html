@@ -111,12 +111,68 @@
       </div>
     </section>
 
+    <!-- Tracking (Phase 0/1/2/3 status) -->
+    <section class="card">
+      <h2>Tracking</h2>
+      <div class="grid">
+        <div class="stat"><span class="k">solve frame</span><span id="solve_frame" class="v">—</span></div>
+        <div class="stat"><span class="k">preset</span><span id="preset_v" class="v">—</span></div>
+        <div class="stat"><span class="k">EE disp / start</span><span id="ee_disp" class="v">—</span></div>
+        <div class="stat"><span class="k">safety radius</span><span id="safety_v" class="v">—</span></div>
+        <div class="stat"><span class="k">clamp scale</span><span id="clamp_v" class="v">—</span></div>
+        <div class="stat"><span class="k">best-effort</span><span id="best_effort" class="v pill">—</span></div>
+        <div class="stat"><span class="k">control rate</span><span id="control_v" class="v">—</span></div>
+        <div class="stat"><span class="k">tool offset</span><span id="tool_v" class="v">—</span></div>
+      </div>
+    </section>
+
+    <!-- Motion & solver (Req 1/2/5 parity with topic/param/service) -->
+    <section class="card">
+      <h2>Motion &amp; solver</h2>
+      <label>stiffness preset
+        <select id="preset-select">
+          <option value="custom">custom (6-vector)</option>
+          <option value="full_pose">full_pose</option>
+          <option value="position_only">position_only</option>
+          <option value="position_yaw">position_yaw</option>
+        </select>
+      </label>
+      <label>custom stiffness [x y z rx ry rz]
+        <input id="stiff6" type="text" placeholder="1 1 1 1 1 1" />
+      </label>
+      <label><input type="checkbox" id="allow-unreach"> allow_unreachable (best-effort stretch)</label>
+      <div class="row3">
+        <label>safety radius (m) <input id="safety-radius" type="number" step="0.05" min="0" /></label>
+        <label>control rate (Hz) <input id="control-rate" type="number" step="5" min="0" /></label>
+        <label>reach gain <input id="reach-gain" type="number" step="0.05" min="0.001" max="1" /></label>
+      </div>
+      <div class="row3">
+        <label>max joint speed <input id="max-speed" type="number" step="0.05" min="0.001" /></label>
+        <label>min move time <input id="min-time" type="number" step="0.1" min="0" /></label>
+        <label>max step (rad) <input id="max-step-in" type="number" step="0.05" min="0" /></label>
+      </div>
+      <button id="btn-apply-motion" class="btn btn-go">Apply settings</button>
+      <div class="vf-section">Tool offset <span class="muted">(structural; disable first)</span></div>
+      <div class="row3">
+        <label>tx <input id="tool-x" type="number" step="0.01" value="0" /></label>
+        <label>ty <input id="tool-y" type="number" step="0.01" value="0" /></label>
+        <label>tz <input id="tool-z" type="number" step="0.01" value="0" /></label>
+      </div>
+      <div class="row3">
+        <label>roll <input id="tool-r" type="number" step="0.05" value="0" /></label>
+        <label>pitch <input id="tool-p" type="number" step="0.05" value="0" /></label>
+        <label>yaw <input id="tool-yw" type="number" step="0.05" value="0" /></label>
+      </div>
+      <button id="btn-apply-tool" class="btn">Apply tool offset</button>
+    </section>
+
     <!-- Enable / disable -->
     <section class="card">
       <h2>Engage <span class="warn">(commands the real robot)</span></h2>
       <div class="row">
         <button id="btn-enable" class="btn btn-go">Enable</button>
         <button id="btn-disable" class="btn btn-stop">Disable / Stop</button>
+        <button id="btn-return" class="btn">Return to start</button>
       </div>
     </section>
 

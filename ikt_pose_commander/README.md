@@ -34,7 +34,22 @@ shaper (velocity/accel limiting at 200 Hz) is the downstream safety backstop.
 * **Starts DISABLED.** No motion until you call `~/enable`. (`start_enabled` can
   override, but defaults to `false`.)
 * **Reachability gate:** solutions with `reachable == false` (joint-limit,
-  singular, task-conflict, max-iters) are rejected — never commanded.
+  singular, task-conflict, max-iters) are rejected by default. Set
+  `allow_unreachable=true` to instead command the solver's **best-effort closest
+  config** (the arm *stretches toward* an out-of-reach target) — still bounded
+  by every gate below.
+* **30 cm Cartesian envelope (`safety_radius_m`, default 0.30):** on `~/enable`
+  the controlled frame's pose is captured as the **start**; thereafter every
+  command is checked: in `jtc` a target whose predicted EE leaves the sphere is
+  **rejected**; in `fpc` the joint step is **clamped** so the EE lands on the
+  sphere boundary. Runs *regardless of* reachability — it is the primary
+  software bound on motion.
+* **Measured-TCP watchdog (independent backstop):**
+  [`tools/ikt_safety_watchdog.py`](../../../tools/ikt_safety_watchdog.py) reads
+  the **real** TCP at ≥5 Hz and calls `~/disable` if it leaves the sphere (fails
+  safe on read errors too). Run it for every real-robot test.
+* **Return-to-start:** `~/return_to_start` (Trigger) commands a JTC move back to
+  the captured start pose and waits for completion — use it between tests.
 * **Jump protection:** a solve whose max joint change from the *current measured*
   pose exceeds `max_step_rad` is rejected.
 * **Speed limiting (JTC):** every move's duration is
@@ -163,7 +178,11 @@ so the dashboard cannot bypass reachability / jump / speed limits. Default port
 **Publishes**
 * `/<fpc_controller>/commands` (`std_msgs/Float64MultiArray`) — in `fpc` mode.
 * `~/status` (`std_msgs/String` JSON) — enabled, mode, last message, last solve
-  (reachable/reason/residual), last step size, freshness.
+  (reachable/reason/residual), last step size, freshness, plus the safety/feature
+  fields: `safety_radius_m`, `start_ee`, `ee_displacement`, `clamp_scale`,
+  `allow_unreachable`, `stiffness_preset`, `reach_gain`, `control_rate_hz`,
+  `best_effort`, `solve_frame`, `tool_offset_xyz/rpy`, `current_ee` (the
+  controlled/tool tip pose, used by the dashboard's tool-aware *Capture*).
 
 **Actions / services used**
 * `/<jtc_controller>/follow_joint_trajectory` (sends moves in `jtc` mode).
@@ -171,6 +190,8 @@ so the dashboard cannot bypass reachability / jump / speed limits. Default port
 
 **Services offered**
 * `~/enable`, `~/disable`, `~/stop` (`std_srvs/Trigger`).
+* `~/return_to_start` (`std_srvs/Trigger`) — JTC move back to the pose captured
+  at the last `~/enable`; blocks until the move completes.
 
 ### Runtime configuration (unified)
 
@@ -187,11 +208,25 @@ Keys split by how they apply:
 * **Live** (take effect immediately, even while enabled): `base_frame`,
   `max_joint_speed`, `min_move_time`, `max_step_rad`, `joint_states_stale_after`,
   `joint_centering_weight`, `damping`, `tol_pos`, `tol_ori`, `max_iters`,
-  `default_stiffness`.
-* **Structural** (change the kinematic group / controllers; **refused while
-  enabled** — disable first): `controlled_frame`, `joints`, `jtc_controller`,
-  `fpc_controller`, `command_mode`. Naming only `controlled_frame` re-derives
+  `default_stiffness`, `safety_radius_m`, `allow_unreachable`,
+  `stiffness_preset`, `reach_gain`, `control_rate_hz`.
+* **Structural** (change the kinematic group / controllers / tool; **refused
+  while enabled** — disable first): `controlled_frame`, `joints`,
+  `jtc_controller`, `fpc_controller`, `command_mode`, `tool_offset_xyz`,
+  `tool_offset_rpy`, `tool_frame_name`. Naming only `controlled_frame` re-derives
   `joints` + controllers automatically.
+
+**New tunables (this revision):**
+
+| key | kind | meaning |
+|---|---|---|
+| `safety_radius_m` | live | radius (m) of the Cartesian motion envelope around the start pose (default 0.30). |
+| `allow_unreachable` | live | `true` = best-effort: command the closest config and *stretch toward* unreachable targets (default `false`). |
+| `stiffness_preset` | live | `full_pose` \| `position_only` \| `position_yaw` \| `custom`. How hard each DOF reaches; `custom` uses `default_stiffness`. |
+| `reach_gain` | live | (0,1] FPC approach scaling: command `cur + reach_gain·(q_cmd−cur)` for a gradual, smoother stretch (default 1.0). |
+| `control_rate_hz` | live | >0 starts a control loop that re-solves+commands the latest target at this rate (smooth FPC streaming / single-target tracking). 0 = event-driven. Capped at 250 Hz. |
+| `tool_offset_xyz` / `tool_offset_rpy` | structural | a virtual **tool frame** fixed to `controlled_frame`; targets then apply to this offset tip. All-zero clears it. |
+| `tool_frame_name` | structural | name of the virtual tool frame (default `ikt_tool`). |
 
 ```bash
 # set the controlled (target) link and the base reference link at runtime
