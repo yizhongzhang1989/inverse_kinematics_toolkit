@@ -32,6 +32,7 @@ names), mirroring the cartesian_control_manager left/right pattern.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from typing import Dict, List, Optional
@@ -94,7 +95,8 @@ def _latched_qos() -> QoSProfile:
 # params, the ``~/configure`` topic, AND ``ros2 param set`` all funnel through
 # the same apply path -> ONE unified way to set any of them, at launch or live.
 _LIVE_KEYS = (
-    "base_frame", "max_joint_speed", "min_move_time", "max_step_rad",
+    "base_frame", "max_joint_speed", "max_joint_accel", "min_move_time",
+    "max_step_rad",
     "joint_states_stale_after", "joint_centering_weight", "damping",
     "tol_pos", "tol_ori", "max_iters", "default_stiffness",
     "safety_radius_m", "allow_unreachable", "stiffness_preset", "reach_gain",
@@ -110,6 +112,9 @@ _STIFFNESS_PRESETS = ("full_pose", "position_only", "position_yaw", "custom")
 # FPC republish deadband: skip streaming a setpoint that is essentially the
 # previous one (anti-chatter, esp. best-effort holding at a joint limit).
 _FPC_DEADBAND_RAD = 1e-4
+# Settle band for the accel-limited FPC generator: within this distance of the
+# goal the target velocity is zeroed so the joint parks cleanly (no chatter).
+_FPC_SETTLE_RAD = 5e-4
 # JTC re-command deadband: with a control loop, skip re-sending a trajectory
 # goal when the solved config is essentially unchanged (avoids goal spam /
 # restarting the same trajectory every tick).
@@ -168,6 +173,11 @@ class PoseCommander(Node):
         self.declare_parameter("max_iters", 200)
         # safety
         self.declare_parameter("max_joint_speed", 0.5)         # rad/s (JTC dur)
+        # max_joint_accel caps how fast the FPC stream velocity ramps -> smooth
+        # accel/decel (trapezoidal velocity) instead of instant start/stop. Used
+        # only by the control-loop (control_rate_hz>0) FPC generator; JTC timing
+        # is unaffected.
+        self.declare_parameter("max_joint_accel", 3.0)         # rad/s^2 (FPC)
         self.declare_parameter("min_move_time", 0.5)           # s
         self.declare_parameter("max_step_rad", 0.8)            # jump reject
         self.declare_parameter("joint_states_stale_after", 0.5)  # s
@@ -175,10 +185,12 @@ class PoseCommander(Node):
         # (metres) around the pose captured at ~/enable. Enforced in _on_target
         # by the Cartesian gate; backed by tools/ikt_safety_watchdog.py.
         self.declare_parameter("safety_radius_m", 0.30)
-        # control loop (Req 2): >0 Hz re-solves+commands the latest target on a
-        # timer (smooth FPC streaming / single-target tracking). 0 = pure
-        # event-driven (today's behaviour). Capped at _CONTROL_RATE_MAX_HZ.
-        self.declare_parameter("control_rate_hz", 0.0)
+        # control loop (Req 2): >0 Hz re-solves the latest target and streams a
+        # velocity-limited, INTERPOLATED joint setpoint to the FPC on a fixed
+        # timer -> smooth motion (no raw jump to the IK solution). Default
+        # 200 Hz (FPC is the intended operating mode). 0 = pure event-driven.
+        # Capped at _CONTROL_RATE_MAX_HZ.
+        self.declare_parameter("control_rate_hz", 200.0)
         self.declare_parameter("status_rate_hz", 10.0)
 
         gp = self.get_parameter
@@ -211,6 +223,7 @@ class PoseCommander(Node):
         self._tol_ori = float(gp("tol_ori").value)
         self._max_iters = int(gp("max_iters").value)
         self._max_speed = max(1e-3, float(gp("max_joint_speed").value))
+        self._max_accel = max(1e-3, float(gp("max_joint_accel").value))
         self._min_time = max(0.0, float(gp("min_move_time").value))
         self._max_step = float(gp("max_step_rad").value)
         self._js_stale = float(gp("joint_states_stale_after").value)
@@ -261,6 +274,15 @@ class PoseCommander(Node):
         self._last_fpc_cmd: Optional[List[float]] = None
         self._last_best_effort = False
         self._last_jtc_cmd: Optional[List[float]] = None
+        # Velocity-limited FPC stream setpoint (full ctrl-joint width). Under a
+        # control loop (control_rate_hz>0) each tick advances this toward the IK
+        # goal by at most max_joint_speed/rate per joint -> a smooth interpolated
+        # ramp instead of a raw jump to the solved config. None = re-seed from
+        # the current measured joints on the next tick (reset on enable/disable).
+        self._fpc_stream: Optional[Dict[str, float]] = None
+        # Per-joint commanded velocity for the accel-limited FPC generator
+        # (rad/s), integrated alongside _fpc_stream. Reset on enable/disable.
+        self._fpc_vel: Optional[Dict[str, float]] = None
         # control loop (Phase 3): latest resolved target + its timer
         self._last_target = None              # (xyz, quat) in the solver frame
         self._control_timer = None
@@ -506,6 +528,7 @@ class PoseCommander(Node):
         with self._lock:
             for key, attr, lo in (
                 ("max_joint_speed", "_max_speed", 1e-3),
+                ("max_joint_accel", "_max_accel", 1e-3),
                 ("min_move_time", "_min_time", 0.0),
                 ("max_step_rad", "_max_step", None),
                 ("joint_states_stale_after", "_js_stale", None),
@@ -913,13 +936,20 @@ class PoseCommander(Node):
         max_delta = max(abs(q_cmd[j] - cur[j]) for j in self._joints)
         with self._lock:
             self._last_delta = max_delta
-        if max_delta > self._max_step:
+            mode = self._mode
+            rate = self._control_rate
+        # Jump protection. Under the FPC control loop (control_rate_hz>0) the
+        # step is instead velocity-limited and interpolated in _command_fpc
+        # (smooth ramp toward the goal), so the hard reject applies only to JTC
+        # and event-driven FPC.
+        interpolated_fpc = (mode == "fpc" and rate > 0.0)
+        if max_delta > self._max_step and not interpolated_fpc:
             self._set_msg(
                 "target REJECTED: step %.3f rad > max_step_rad %.3f "
                 "(jump protection)" % (max_delta, self._max_step))
             return
 
-        if self._mode == "jtc":
+        if mode == "jtc":
             self._command_jtc(q_cmd, max_delta, best_effort)
         else:
             self._command_fpc(q_cmd, best_effort)
@@ -971,9 +1001,20 @@ class PoseCommander(Node):
         q = model.neutral()
         with self._lock:
             jp = dict(self._joint_pos)
+            # In the FPC control loop, seed the controlled joints from the smooth
+            # commanded stream so the IK goal is deterministic (it does not track
+            # measured-joint noise) -> steady hold + a consistent solve. Falls
+            # back to measured joints (event-driven, JTC, or first tick).
+            stream = (dict(self._fpc_stream)
+                      if (self._mode == "fpc" and self._control_rate > 0.0
+                          and self._fpc_stream) else None)
         for jn in model.joint_names:
             if jn in jp:
                 q[model.q_index(jn)] = jp[jn]
+        if stream is not None:
+            for jn, v in stream.items():
+                if jn in model.joint_names:
+                    q[model.q_index(jn)] = float(v)
         return q
 
     def _solve(self, model, seed, xyz, quat):
@@ -1132,31 +1173,79 @@ class PoseCommander(Node):
             gain = self._reach_gain
             last = self._last_fpc_cmd
             rate = self._control_rate
-        # Command the controller's FULL joint set: solved values for the
+            max_speed = self._max_speed
+            max_accel = self._max_accel
+            stream = dict(self._fpc_stream) if self._fpc_stream else None
+            vel = dict(self._fpc_vel) if self._fpc_vel else None
+        # Goal = the controller's FULL joint set: solved values for the
         # controlled sub-group, current position (hold) for the rest. The
         # ForwardCommandController drops a command whose width != its joint
         # count, so a sub-group (e.g. link_4) would otherwise never move.
-        # Approach scaling (Req 5): a gradual step toward the target per cycle
-        # (gain=1.0 default = full step), applied to the controlled joints.
-        use_gain = 0.0 < gain < 1.0 and all(
-            cur[j] is not None for j in ctrl_joints if j in controlled)
-        data = []
+        goal = {}
         for j in ctrl_joints:
             if j in controlled and j in q_cmd:
-                v = float(q_cmd[j])
-                if use_gain and cur[j] is not None:
-                    v = float(cur[j] + gain * (v - cur[j]))
+                goal[j] = float(q_cmd[j])
             else:
-                v = float(cur[j] if cur[j] is not None else q_cmd.get(j, 0.0))
-            data.append(v)
-        # Deadband: in EVENT-DRIVEN mode skip republishing an unchanged setpoint
-        # (anti-chatter; the controller latches it). Under a control loop
-        # (rate>0) keep streaming so the FPC input stays fed at the loop rate.
-        if rate <= 0.0 and last is not None and len(last) == len(data) and \
-                max(abs(a - b) for a, b in zip(data, last)) < _FPC_DEADBAND_RAD:
-            return
-        with self._lock:
-            self._last_fpc_cmd = data
+                goal[j] = float(cur[j] if cur[j] is not None
+                                else q_cmd.get(j, 0.0))
+
+        if rate > 0.0:
+            # Acceleration-limited joint-space trajectory generation: drive a
+            # per-joint velocity toward the IK goal, capped at max_joint_speed
+            # AND ramped within max_joint_accel, then integrate to the streamed
+            # position. This produces a smooth trapezoidal-velocity profile (no
+            # jerk at start/stop or on a moving target) the FPC servo tracks
+            # cleanly -- the FPC has no interpolation of its own. The stopping-
+            # distance cap sqrt(2*a*d) brakes in time so the joint settles on the
+            # goal without overshoot/chatter. Seed position from the current
+            # joints and velocity from rest on the first tick after enable.
+            if stream is None:
+                stream = {j: (cur[j] if cur[j] is not None else goal[j])
+                          for j in ctrl_joints}
+            if vel is None:
+                vel = {j: 0.0 for j in ctrl_joints}
+            dt = 1.0 / rate
+            dv_max = max_accel * dt
+            data = []
+            for j in ctrl_joints:
+                dist = goal[j] - stream[j]
+                if abs(dist) < _FPC_SETTLE_RAD:
+                    v_des = 0.0
+                else:
+                    v_brake = math.sqrt(2.0 * max_accel * abs(dist))
+                    v_des = math.copysign(min(max_speed, v_brake), dist)
+                dv = v_des - vel[j]
+                if dv > dv_max:
+                    dv = dv_max
+                elif dv < -dv_max:
+                    dv = -dv_max
+                vel[j] = vel[j] + dv
+                stream[j] = stream[j] + vel[j] * dt
+                data.append(stream[j])
+            with self._lock:
+                self._fpc_stream = stream
+                self._fpc_vel = vel
+                self._last_fpc_cmd = data
+        else:
+            # Event-driven (rate=0): publish the solved setpoint directly, with
+            # optional reach_gain approach scaling (gradual stretch per cycle).
+            use_gain = 0.0 < gain < 1.0 and all(
+                cur[j] is not None for j in ctrl_joints if j in controlled)
+            data = []
+            for j in ctrl_joints:
+                v = goal[j]
+                if j in controlled and j in q_cmd and use_gain \
+                        and cur[j] is not None:
+                    v = float(cur[j] + gain * (goal[j] - cur[j]))
+                data.append(v)
+            # Deadband: skip republishing an essentially unchanged setpoint
+            # (anti-chatter; the controller latches it).
+            if last is not None and len(last) == len(data) and \
+                    max(abs(a - b) for a, b in zip(data, last)) \
+                    < _FPC_DEADBAND_RAD:
+                return
+            with self._lock:
+                self._last_fpc_cmd = data
         m = Float64MultiArray()
         m.data = data
         self._fpc_pub.publish(m)
@@ -1214,6 +1303,8 @@ class PoseCommander(Node):
             self._last_clamp_scale = 1.0
             self._last_fpc_cmd = None
             self._last_jtc_cmd = None
+            self._fpc_stream = None
+            self._fpc_vel = None
             self._last_target = None
             self._last_best_effort = False
         self._set_msg(
@@ -1227,6 +1318,8 @@ class PoseCommander(Node):
         with self._lock:
             self._enabled = False
             self._last_target = None
+            self._fpc_stream = None
+            self._fpc_vel = None
             mode, jtc, fpc = self._mode, self._jtc, self._fpc
         # Return to JTC, which holds the current pose.
         if self._do_switch and mode == "fpc" and jtc and fpc:
@@ -1440,6 +1533,7 @@ class PoseCommander(Node):
             "last_step_rad": delta,
             "max_step_rad": self._max_step,
             "max_joint_speed": self._max_speed,
+            "max_joint_accel": self._max_accel,
             "min_move_time": self._min_time,
             "joint_states_stale_after": self._js_stale,
             "default_stiffness": list(self._stiffness),
