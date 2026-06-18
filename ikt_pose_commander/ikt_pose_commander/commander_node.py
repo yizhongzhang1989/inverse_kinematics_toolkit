@@ -736,19 +736,33 @@ class PoseCommander(Node):
             return out
         resp = fut.result()
         want = {f"{j}/position" for j in joints}
-        best = {"jtc": -1, "fpc": -1}
+        # Score each candidate by (joint coverage, is-active) so a tie on
+        # coverage prefers the ACTIVE controller -- e.g. a UR ships BOTH an
+        # inactive ``joint_trajectory_controller`` and the active
+        # ``scaled_joint_trajectory_controller``; the active one is the one that
+        # actually drives the arm.
+        best = {"jtc": (-1, -1), "fpc": (-1, -1)}
         for ctl in getattr(resp, "controller", []):
             req_if = set(getattr(ctl, "required_command_interfaces", []) or [])
             cover = len(want & req_if)
             if cover == 0:
                 continue
+            score = (cover, 1 if getattr(ctl, "state", "") == "active" else 0)
             t = ctl.type
-            if t.endswith("JointTrajectoryController") and cover > best["jtc"]:
-                best["jtc"] = cover
-                out["jtc"] = ctl.name
-            elif t.endswith("ForwardCommandController") and cover > best["fpc"]:
-                best["fpc"] = cover
-                out["fpc"] = ctl.name
+            if t.endswith("JointTrajectoryController"):
+                if score > best["jtc"]:
+                    best["jtc"] = score
+                    out["jtc"] = ctl.name
+            # A position forward-command controller streams the same
+            # Float64MultiArray of joint positions on ``~/commands``. Match the
+            # ros2_control ForwardCommandController AND position_controllers'
+            # JointGroupPositionController (what UR ships as
+            # ``forward_position_controller``) so FPC mode transfers unchanged.
+            elif (t.endswith("ForwardCommandController")
+                  or t.endswith("JointGroupPositionController")):
+                if score > best["fpc"]:
+                    best["fpc"] = score
+                    out["fpc"] = ctl.name
         return out
 
     def _controller_joint_map(self) -> Dict[str, List[str]]:
