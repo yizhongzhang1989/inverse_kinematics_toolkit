@@ -67,14 +67,13 @@ except ImportError:  # pragma: no cover
 try:
     from ikt_core.robot_model import RobotModel
     from ikt_core import ik_core
-    from ikt_core.tasks import Task, VirtualFrame
+    from ikt_core.tasks import Task
     from ikt_core.safety import clamp_config_to_sphere, frame_displacement
     _IK_IMPORT_ERROR: Optional[str] = None
 except Exception as _exc:  # noqa: BLE001  pragma: no cover
     RobotModel = None  # type: ignore
     ik_core = None  # type: ignore
     Task = None  # type: ignore
-    VirtualFrame = None  # type: ignore
     clamp_config_to_sphere = None  # type: ignore
     frame_displacement = None  # type: ignore
     _IK_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
@@ -103,7 +102,7 @@ _LIVE_KEYS = (
 )
 _STRUCTURAL_KEYS = (
     "controlled_frame", "joints", "jtc_controller", "fpc_controller",
-    "command_mode", "tool_offset_xyz", "tool_offset_rpy", "tool_frame_name",
+    "command_mode",
 )
 
 # Valid stiffness presets (Req 5: "how hard each DOF reaches the target").
@@ -144,13 +143,7 @@ class PoseCommander(Node):
         self.declare_parameter("joints", [""])
         self.declare_parameter("jtc_controller", "")
         self.declare_parameter("fpc_controller", "")
-        self.declare_parameter("command_mode", "jtc")          # jtc | fpc
-        # tool offset (Req 1): a virtual tool frame fixed to controlled_frame;
-        # targets then apply to this offset tip. Structural (rebuilds the IK
-        # model). All-zero offset = no tool (targets the control link itself).
-        self.declare_parameter("tool_offset_xyz", [0.0, 0.0, 0.0])
-        self.declare_parameter("tool_offset_rpy", [0.0, 0.0, 0.0])
-        self.declare_parameter("tool_frame_name", "ikt_tool")
+        self.declare_parameter("command_mode", "fpc")          # fpc | jtc
         self.declare_parameter("start_enabled", False)         # SAFETY: off
         self.declare_parameter("switch_controllers", True)
         self.declare_parameter("controller_manager", "/controller_manager")
@@ -199,18 +192,6 @@ class PoseCommander(Node):
         self._jtc = str(gp("jtc_controller").value or "")
         self._fpc = str(gp("fpc_controller").value or "")
         self._mode = str(gp("command_mode").value).strip().lower()
-        # tool offset state (Req 1). _solve_frame is the frame IK actually
-        # targets: the tool tip when an offset is active, else the control link.
-        self._tool_frame_name = str(gp("tool_frame_name").value or "ikt_tool")
-        _txyz = self._parse3(gp("tool_offset_xyz").value)
-        _trpy = self._parse3(gp("tool_offset_rpy").value)
-        if _txyz is not None and (any(_txyz) or (_trpy and any(_trpy))):
-            self._tool_offset_xyz = _txyz
-            self._tool_offset_rpy = _trpy if _trpy is not None else [0.0, 0.0, 0.0]
-        else:
-            self._tool_offset_xyz = None
-            self._tool_offset_rpy = None
-        self._solve_frame = self._frame
         self._do_switch = bool(gp("switch_controllers").value)
         self._cm = str(gp("controller_manager").value or "/controller_manager")
         self._stiffness = [float(v) for v in gp("default_stiffness").value]
@@ -287,10 +268,6 @@ class PoseCommander(Node):
                              "jtc_controller": self._jtc or None,
                              "fpc_controller": self._fpc or None,
                              "command_mode": self._mode}
-            if self._tool_offset_xyz is not None:
-                self._req_cfg["tool_offset_xyz"] = self._tool_offset_xyz
-                self._req_cfg["tool_offset_rpy"] = self._tool_offset_rpy
-                self._req_cfg["tool_frame_name"] = self._tool_frame_name
 
         self._cbg = ReentrantCallbackGroup()
         cb = self._cbg
@@ -309,6 +286,12 @@ class PoseCommander(Node):
         # Controller-dependent endpoints are (re)created on configure.
         self._fpc_pub = None
         self._jtc_client = None
+        # ...cached by controller name and REUSED across reconfigures. Destroying
+        # an ActionClient that still has a status pending in the executor's ready
+        # list crashes rclpy ("action client pointer is invalid"), so we never
+        # tear these down mid-life — we only swap which cached one is active.
+        self._fpc_pub_cache = {}
+        self._jtc_client_cache = {}
         self._status_pub = self.create_publisher(String, "~/status", 10)
 
         # ---- switch + list clients --------------------------------------
@@ -401,24 +384,13 @@ class PoseCommander(Node):
             self._try_enable()
 
     def _rebuild_model_from_urdf(self):
-        """(Re)build ``self._model`` from ``self._urdf``, re-applying any
-        configured tool offset so a URDF update preserves the virtual tool frame.
-        """
+        """(Re)build ``self._model`` from ``self._urdf``."""
         with self._lock:
             urdf = self._urdf
-            frame = self._frame
-            xyz = self._tool_offset_xyz
-            rpy = self._tool_offset_rpy
-            name = self._tool_frame_name
         if not urdf or RobotModel is None:
             return False, "no robot_description"
-        vframes = []
-        if xyz is not None and frame:
-            vframes = [VirtualFrame(name, frame, tuple(xyz),
-                                    tuple(rpy or (0.0, 0.0, 0.0))).as_aux_frame()]
         try:
-            model = (RobotModel(urdf, virtual_frames=vframes) if vframes
-                     else RobotModel(urdf))
+            model = RobotModel(urdf)
         except Exception as exc:  # noqa: BLE001
             return False, "model build failed: %r" % exc
         with self._lock:
@@ -649,15 +621,11 @@ class PoseCommander(Node):
         self._process_target(model, tgt[0], tgt[1])
 
     def _apply_structural(self, req: dict):
-        """Apply a kinematic-group / controller / tool reconfig. Refused while
-        enabled.
+        """Apply a kinematic-group / controller reconfig. Refused while enabled.
 
-        Selects the control link (``controlled_frame``), derives the joints,
-        picks the JTC/FPC controllers, and — when a ``tool_offset_*`` is given —
-        rebuilds the IK model with a virtual tool frame fixed to the control
-        link and targets that offset tip. The user-facing ``controlled_frame``
-        stays the real link (for discovery); the solver targets ``solve_frame``.
-        ``joints`` and controller names are auto-derived when omitted.
+        Selects the control link (``controlled_frame``), derives the joints, and
+        picks the JTC/FPC controllers. ``joints`` and controller names are
+        auto-derived when omitted.
         """
         with self._lock:
             if self._enabled:
@@ -666,7 +634,6 @@ class PoseCommander(Node):
             cur_frame, cur_joints = self._frame, list(self._joints)
             cur_jtc, cur_fpc, cur_mode = self._jtc, self._fpc, self._mode
             cur_configured = self._configured
-            cur_tool = self._tool_tuple_locked()
         if not urdf or RobotModel is None:
             return False, "no model yet"
 
@@ -680,27 +647,14 @@ class PoseCommander(Node):
         if not frame:
             return False, "controlled_frame required"
 
-        # tool offset (Req 1): merge request over current state
-        tool, terr = self._resolve_tool_offset(req, cur_tool)
-        if terr:
-            return False, terr
-
-        # build the desired model (with the tool virtual frame if active)
-        vframes = []
-        if tool is not None:
-            vframes = [VirtualFrame(tool[2], frame, tuple(tool[0]),
-                                    tuple(tool[1])).as_aux_frame()]
         try:
-            model = (RobotModel(urdf, virtual_frames=vframes) if vframes
-                     else RobotModel(urdf))
+            model = RobotModel(urdf)
         except Exception as exc:  # noqa: BLE001
-            return False, "model build failed (tool offset?): %r" % exc
+            return False, "model build failed: %r" % exc
         if not model.has_frame(frame):
             return False, f"unknown link/frame '{frame}'"
-        if tool is not None and not model.has_frame(tool[2]):
-            return False, f"tool frame '{tool[2]}' not created"
 
-        # joints: explicit > derived from the PARENT control link > kept
+        # joints: explicit > derived from the control link > kept
         joints = req.get("joints")
         if joints:
             joints = [str(j) for j in joints if str(j)]
@@ -735,64 +689,19 @@ class PoseCommander(Node):
             return False, ("no ForwardCommandController found driving %s; "
                            "set fpc_controller explicitly" % joints)
 
-        solve_frame = tool[2] if tool is not None else frame
         with self._lock:
             self._model = model
             self._frame, self._joints = frame, joints
-            self._solve_frame = solve_frame
-            self._tool_offset_xyz = list(tool[0]) if tool else None
-            self._tool_offset_rpy = list(tool[1]) if tool else None
-            if tool:
-                self._tool_frame_name = tool[2]
             self._jtc, self._fpc, self._mode = jtc, fpc, mode
             self._configured = True
+            # The captured start pose / motion envelope belonged to the previous
+            # group; invalidate it so it is re-captured on the next ~/enable (and
+            # a return-to-start before re-enabling is refused, not crashing).
+            self._start_q = None
+            self._start_ee_xyz = None
         self._rebuild_clients()
-        tool_msg = ""
-        if tool is not None:
-            tool_msg = " tool=%s xyz=%s" % (solve_frame, list(tool[0]))
-        return True, (f"link={frame} solve={solve_frame} joints={len(joints)} "
-                      f"mode={mode} jtc={jtc or '-'} fpc={fpc or '-'}{tool_msg}")
-
-    def _tool_tuple_locked(self):
-        """Current tool as ``(xyz, rpy, name)`` or ``None``. Caller holds _lock."""
-        if self._tool_offset_xyz is None:
-            return None
-        return (list(self._tool_offset_xyz),
-                list(self._tool_offset_rpy or [0.0, 0.0, 0.0]),
-                self._tool_frame_name)
-
-    def _resolve_tool_offset(self, req: dict, cur_tool):
-        """Merge tool keys in ``req`` over ``cur_tool``.
-
-        Returns ``(tool, err)`` where ``tool`` is ``(xyz, rpy, name)`` or
-        ``None`` (no/cleared offset; an all-zero offset clears it). ``err`` is a
-        non-empty string on a parse error.
-        """
-        keys = ("tool_offset_xyz", "tool_offset_rpy", "tool_frame_name")
-        if not any(k in req for k in keys):
-            return cur_tool, ""
-        cxyz = list(cur_tool[0]) if cur_tool else [0.0, 0.0, 0.0]
-        crpy = list(cur_tool[1]) if cur_tool else [0.0, 0.0, 0.0]
-        cname = cur_tool[2] if cur_tool else self._tool_frame_name
-        xyz = self._parse3(req["tool_offset_xyz"]) if "tool_offset_xyz" in req \
-            else cxyz
-        rpy = self._parse3(req["tool_offset_rpy"]) if "tool_offset_rpy" in req \
-            else crpy
-        if xyz is None or rpy is None:
-            return None, "tool_offset_xyz/rpy must each be 3 numbers"
-        name = str(req.get("tool_frame_name") or cname or "ikt_tool")
-        if not any(xyz) and not any(rpy):
-            return None, ""  # cleared back to no offset
-        return (xyz, rpy, name), ""
-
-    @staticmethod
-    def _parse3(v):
-        """Parse a 3-vector of floats; return a list[3] or None."""
-        try:
-            out = [float(x) for x in v]
-        except (TypeError, ValueError):
-            return None
-        return out if len(out) == 3 else None
+        return True, (f"link={frame} joints={len(joints)} "
+                      f"mode={mode} jtc={jtc or '-'} fpc={fpc or '-'}")
 
     def _discover_controllers(self, joints) -> dict:
         """Find JTC + FPC controllers whose command interfaces cover ``joints``.
@@ -829,30 +738,37 @@ class PoseCommander(Node):
         return out
 
     def _rebuild_clients(self) -> None:
-        """(Re)create the FPC publisher + JTC action client for current names."""
+        """Point the FPC publisher + JTC action client at the current controllers.
+
+        Endpoints are created lazily ONCE per controller name and cached; we only
+        swap which cached endpoint is "active". They are never destroyed while the
+        node spins, because tearing down an ActionClient that still has a status
+        pending in the executor's ready list crashes rclpy with "action client
+        pointer is invalid" (hit when reconfiguring right after a JTC move).
+        """
         with self._lock:
             jtc, fpc = self._jtc, self._fpc
-        # FPC command publisher
-        if self._fpc_pub is not None:
-            try:
-                self.destroy_publisher(self._fpc_pub)
-            except Exception:  # noqa: BLE001
-                pass
-            self._fpc_pub = None
+        # FPC command publisher (cached by controller name, never destroyed here)
         if fpc:
-            self._fpc_pub = self.create_publisher(
-                Float64MultiArray, f"/{fpc}/commands", 10)
-        # JTC action client
-        if self._jtc_client is not None:
-            try:
-                self._jtc_client.destroy()
-            except Exception:  # noqa: BLE001
-                pass
-            self._jtc_client = None
+            pub = self._fpc_pub_cache.get(fpc)
+            if pub is None:
+                pub = self.create_publisher(
+                    Float64MultiArray, f"/{fpc}/commands", 10)
+                self._fpc_pub_cache[fpc] = pub
+            self._fpc_pub = pub
+        else:
+            self._fpc_pub = None
+        # JTC action client (cached by controller name, never destroyed here)
         if jtc and _HAS_FJT:
-            self._jtc_client = ActionClient(
-                self, FollowJointTrajectory,
-                f"/{jtc}/follow_joint_trajectory", callback_group=self._cbg)
+            client = self._jtc_client_cache.get(jtc)
+            if client is None:
+                client = ActionClient(
+                    self, FollowJointTrajectory,
+                    f"/{jtc}/follow_joint_trajectory", callback_group=self._cbg)
+                self._jtc_client_cache[jtc] = client
+            self._jtc_client = client
+        else:
+            self._jtc_client = None
 
     # ------------------------------------------------------------------ #
     # Main path: target -> solve -> gate -> command
@@ -966,7 +882,7 @@ class PoseCommander(Node):
         with self._lock:
             start = self._start_ee_xyz
             radius = self._safety_radius
-            frame = self._solve_frame
+            frame = self._frame
             mode = self._mode
         if start is None or radius <= 0.0 or frame_displacement is None:
             return True, q_full, ""
@@ -1025,7 +941,7 @@ class PoseCommander(Node):
         orientation can't be matched).
         """
         with self._lock:
-            frame = self._solve_frame
+            frame = self._frame
             preset = self._stiffness_preset
             stiff = tuple(self._stiffness)
         xyz_t = tuple(float(v) for v in xyz)
@@ -1182,7 +1098,7 @@ class PoseCommander(Node):
             model = self._model
             configured = self._configured
             mode, jtc, fpc = self._mode, self._jtc, self._fpc
-            solve_frame, joints = self._solve_frame, list(self._joints)
+            frame, joints = self._frame, list(self._joints)
         if not configured:
             return False, ("unconfigured; name the link to control via "
                            "~/configure or the dashboard first")
@@ -1204,11 +1120,11 @@ class PoseCommander(Node):
                 return False, self._last_msg or "controller switch failed"
         # SAFETY (Phase 0): capture the start pose = centre of the 30 cm motion
         # envelope. Record the measured joints (for return-to-start) and the
-        # SOLVE frame's position via FK (the tool tip when an offset is active).
+        # controlled frame's position via FK.
         seed = self._build_seed(model)
         try:
             with self._fk_lock:
-                start_xyz, _ = model.fk(seed, solve_frame)
+                start_xyz, _ = model.fk(seed, frame)
         except Exception as exc:  # noqa: BLE001
             return False, "cannot enable: FK of start pose failed (%r)" % exc
         with self._lock:
@@ -1283,6 +1199,13 @@ class PoseCommander(Node):
             do_switch = self._do_switch
         if start_q is None:
             return False, "no start pose captured; enable first"
+        # The start pose is captured per-joint at ~/enable. If the controlled
+        # group changed since then (different joints), the captured pose no
+        # longer covers the current joints -> refuse cleanly instead of raising
+        # a KeyError (which previously crashed the node).
+        if any(j not in start_q for j in joints):
+            return False, ("start pose was captured for a different controlled "
+                           "group; re-enable before return-to-start")
         if model is None or not configured:
             return False, "not configured"
         if not self._js_fresh():
@@ -1418,25 +1341,6 @@ class PoseCommander(Node):
             stiffness_preset = self._stiffness_preset
             reach_gain = self._reach_gain
             best_effort = self._last_best_effort
-            solve_frame = self._solve_frame
-            tool_xyz = (list(self._tool_offset_xyz)
-                        if self._tool_offset_xyz is not None else None)
-            tool_rpy = (list(self._tool_offset_rpy)
-                        if self._tool_offset_rpy is not None else None)
-            tool_name = self._tool_frame_name
-        # Current SOLVE-frame (tool tip) position via FK, so the dashboard's
-        # "capture current" returns the tool pose when an offset is active.
-        current_ee = None
-        current_ee_quat = None
-        if model is not None and configured and solve_frame and self._js_fresh():
-            try:
-                seed_now = self._build_seed(model)
-                with self._fk_lock:
-                    cee, ceq = model.fk(seed_now, solve_frame)
-                current_ee = [float(v) for v in cee]
-                current_ee_quat = [float(v) for v in ceq]
-            except Exception:  # noqa: BLE001
-                current_ee = None
         status = {
             "enabled": enabled,
             "configured": configured,
@@ -1463,12 +1367,6 @@ class PoseCommander(Node):
             "stiffness_preset": stiffness_preset,
             "reach_gain": reach_gain,
             "best_effort": best_effort,
-            "solve_frame": solve_frame,
-            "tool_offset_xyz": tool_xyz,
-            "tool_offset_rpy": tool_rpy,
-            "tool_frame_name": tool_name,
-            "current_ee": current_ee,
-            "current_ee_quat": current_ee_quat,
             "commands_robot": True,
         }
         if model is not None:

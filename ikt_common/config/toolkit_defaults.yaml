@@ -44,14 +44,20 @@ ikt_inverse_kinematics:
 # -----------------------------------------------------------------------------
 # ikt_pose_commander -- target pose -> IK -> robot motion (safety-gated).
 # ROBOT-INDEPENDENT: only robot-neutral defaults here. The link to control and
-# its joints/controllers are chosen at RUNTIME (dashboard or ~/configure) and
-# auto-derived from the URDF + /controller_manager -- never named here.
+# its joints are chosen at RUNTIME (dashboard or ~/configure) and auto-derived
+# from the URDF + /controller_manager. The controllers are auto-derived too, but
+# may be PINNED here (or via the launch arg of the same name) when you want the
+# exact controller -- e.g. command through the forward_position_controller.
 # -----------------------------------------------------------------------------
 ikt_pose_commander:
   robot_description_topic: "/robot_description"
   joint_states_topic: "/joint_states"
   base_frame: ""                  # "" = use the URDF root as the solve frame
-  command_mode: "jtc"             # "jtc" (safe, discrete) | "fpc" (streaming)
+  command_mode: "fpc"             # "fpc" (stream to FPC, default) | "jtc"
+  # Controller names: "" = auto-derive from /controller_manager by matching the
+  # controlled link's joints. Set the exact name to pin it.
+  fpc_controller: ""              # e.g. "forward_position_controller"
+  jtc_controller: ""              # e.g. "arm_1_controller"
   start_enabled: false            # SAFETY: stay disabled until ~/enable
   switch_controllers: true
   controller_manager: "/controller_manager"

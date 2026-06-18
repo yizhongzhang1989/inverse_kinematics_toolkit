@@ -54,7 +54,7 @@
         <div class="vf-joints" id="joint-bars"><div class="muted sm">waiting for model…</div></div>
         <div class="vf-section">TCP pose <span class="muted" id="tcp-frame"></span></div>
         <div class="vf-tcp" id="tcp-pose"><div class="muted sm">no controlled frame</div></div>
-        <div class="vf-hint">click a link to select &middot; drag orbit &middot; wheel zoom</div>
+        <div class="vf-hint">drag to orbit &middot; wheel to zoom &middot; pick the control link in the panel</div>
       </div>
     </div>
   </div>
@@ -72,142 +72,29 @@
       <label>base link <span class="muted">(target reference frame)</span>
         <select id="base-select"><option value="">(robot root)</option></select>
       </label>
-      <label>mode
-        <select id="mode-select"><option value="jtc">jtc (safe)</option><option value="fpc">fpc (stream)</option></select>
-      </label>
       <button id="btn-configure" class="btn btn-go">Configure</button>
-      <div class="grid">
-        <div class="stat"><span class="k">configured</span><span id="configured" class="v pill">—</span></div>
-        <div class="stat"><span class="k">joints (auto)</span><span id="cfg-joints" class="v">—</span></div>
-        <div class="stat"><span class="k">JTC (auto)</span><span id="cfg-jtc" class="v">—</span></div>
-        <div class="stat"><span class="k">FPC (auto)</span><span id="cfg-fpc" class="v">—</span></div>
-      </div>
     </section>
 
-    <!-- Monitor -->
+    <!-- Target frame (the goal pose the controlled link will be driven to match) -->
     <section class="card">
-      <h2>Status</h2>
-      <div class="grid">
-        <div class="stat"><span class="k">enabled</span><span id="enabled" class="v pill">—</span></div>
-        <div class="stat"><span class="k">mode</span><span id="mode" class="v">—</span></div>
-        <div class="stat"><span class="k">model</span><span id="have_model" class="v pill">—</span></div>
-        <div class="stat"><span class="k">joint states</span><span id="js_fresh" class="v pill">—</span></div>
-        <div class="stat"><span class="k">controlled frame</span><span id="frame" class="v">—</span></div>
-        <div class="stat"><span class="k">base frame</span><span id="base" class="v">—</span></div>
+      <h2>Target frame <span class="muted" id="grab-frame"></span></h2>
+      <div class="row">
+        <button id="gizmo-move" type="button" class="btn sm sel">move</button>
+        <button id="gizmo-rotate" type="button" class="btn sm">rotate</button>
+        <button id="btn-snap-target" type="button" class="btn sm">Snap target → link</button>
       </div>
-      <div class="msg" id="last_message">—</div>
-    </section>
-
-    <!-- Last solve -->
-    <section class="card">
-      <h2>Last solve</h2>
-      <div class="grid">
-        <div class="stat"><span class="k">reachable</span><span id="reachable" class="v pill">—</span></div>
-        <div class="stat"><span class="k">reason</span><span id="reason" class="v">—</span></div>
-        <div class="stat"><span class="k">pos err</span><span id="pos_err" class="v">—</span></div>
-        <div class="stat"><span class="k">ori err</span><span id="ori_err" class="v">—</span></div>
-        <div class="stat"><span class="k">joint step</span><span id="step" class="v">—</span></div>
-        <div class="stat"><span class="k">max step</span><span id="max_step" class="v">—</span></div>
-      </div>
-    </section>
-
-    <!-- Tracking (Phase 0/1/2/3 status) -->
-    <section class="card">
-      <h2>Tracking</h2>
-      <div class="grid">
-        <div class="stat"><span class="k">solve frame</span><span id="solve_frame" class="v">—</span></div>
-        <div class="stat"><span class="k">preset</span><span id="preset_v" class="v">—</span></div>
-        <div class="stat"><span class="k">EE disp / start</span><span id="ee_disp" class="v">—</span></div>
-        <div class="stat"><span class="k">safety radius</span><span id="safety_v" class="v">—</span></div>
-        <div class="stat"><span class="k">clamp scale</span><span id="clamp_v" class="v">—</span></div>
-        <div class="stat"><span class="k">best-effort</span><span id="best_effort" class="v pill">—</span></div>
-        <div class="stat"><span class="k">control rate</span><span id="control_v" class="v">—</span></div>
-        <div class="stat"><span class="k">tool offset</span><span id="tool_v" class="v">—</span></div>
-      </div>
-    </section>
-
-    <!-- Motion & solver (Req 1/2/5 parity with topic/param/service) -->
-    <section class="card">
-      <h2>Motion &amp; solver</h2>
-      <label>stiffness preset
-        <select id="preset-select">
-          <option value="custom">custom (6-vector)</option>
-          <option value="full_pose">full_pose</option>
-          <option value="position_only">position_only</option>
-          <option value="position_yaw">position_yaw</option>
-        </select>
-      </label>
-      <label>custom stiffness [x y z rx ry rz]
-        <input id="stiff6" type="text" placeholder="1 1 1 1 1 1" />
-      </label>
-      <label><input type="checkbox" id="allow-unreach"> allow_unreachable (best-effort stretch)</label>
-      <div class="row3">
-        <label>safety radius (m) <input id="safety-radius" type="number" step="0.05" min="0" /></label>
-        <label>control rate (Hz) <input id="control-rate" type="number" step="5" min="0" /></label>
-        <label>reach gain <input id="reach-gain" type="number" step="0.05" min="0.001" max="1" /></label>
-      </div>
-      <div class="row3">
-        <label>max joint speed <input id="max-speed" type="number" step="0.05" min="0.001" /></label>
-        <label>min move time <input id="min-time" type="number" step="0.1" min="0" /></label>
-        <label>max step (rad) <input id="max-step-in" type="number" step="0.05" min="0" /></label>
-      </div>
-      <button id="btn-apply-motion" class="btn btn-go">Apply settings</button>
-      <div class="vf-section">Tool offset <span class="muted">(structural; disable first)</span></div>
-      <div class="row3">
-        <label>tx <input id="tool-x" type="number" step="0.01" value="0" /></label>
-        <label>ty <input id="tool-y" type="number" step="0.01" value="0" /></label>
-        <label>tz <input id="tool-z" type="number" step="0.01" value="0" /></label>
-      </div>
-      <div class="row3">
-        <label>roll <input id="tool-r" type="number" step="0.05" value="0" /></label>
-        <label>pitch <input id="tool-p" type="number" step="0.05" value="0" /></label>
-        <label>yaw <input id="tool-yw" type="number" step="0.05" value="0" /></label>
-      </div>
-      <button id="btn-apply-tool" class="btn">Apply tool offset</button>
+      <div class="vf-hint" id="grab-hint">Drag the target frame in 3D (move / rotate handles). <b>Snap target → link</b> resets it onto the selected control link. Then <b>Snap robot</b> (one move) or <b>Track robot</b> (live) below.</div>
     </section>
 
     <!-- Enable / disable -->
     <section class="card">
       <h2>Engage <span class="warn">(commands the real robot)</span></h2>
       <div class="row">
-        <button id="btn-enable" class="btn btn-go">Enable</button>
-        <button id="btn-disable" class="btn btn-stop">Disable / Stop</button>
-        <button id="btn-return" class="btn">Return to start</button>
+        <button id="btn-snap-robot" class="btn btn-go">Snap robot (jtc)</button>
+        <button id="btn-track-robot" class="btn btn-go">Track robot (fpc)</button>
       </div>
-    </section>
-
-    <!-- Jog -->
-    <section class="card">
-      <h2>Jog <span class="muted">(capture → offset → send)</span></h2>
-      <label>step (m) <input id="jog-step" type="number" value="0.01" step="0.005" min="0.001" /></label>
-      <div class="jog">
-        <button class="btn sm" data-axis="x" data-sign="1">+X</button>
-        <button class="btn sm" data-axis="x" data-sign="-1">−X</button>
-        <button class="btn sm" data-axis="y" data-sign="1">+Y</button>
-        <button class="btn sm" data-axis="y" data-sign="-1">−Y</button>
-        <button class="btn sm" data-axis="z" data-sign="1">+Z</button>
-        <button class="btn sm" data-axis="z" data-sign="-1">−Z</button>
-      </div>
-    </section>
-
-    <!-- Target pose -->
-    <section class="card">
-      <h2>Target pose <span class="muted">(green triad in 3D)</span></h2>
-      <div class="row3">
-        <label>x <input id="tx" type="number" step="0.01" /></label>
-        <label>y <input id="ty" type="number" step="0.01" /></label>
-        <label>z <input id="tz" type="number" step="0.01" /></label>
-      </div>
-      <div class="row4">
-        <label>qw <input id="qw" type="number" step="0.01" value="1" /></label>
-        <label>qx <input id="qx" type="number" step="0.01" value="0" /></label>
-        <label>qy <input id="qy" type="number" step="0.01" value="0" /></label>
-        <label>qz <input id="qz" type="number" step="0.01" value="0" /></label>
-      </div>
-      <label>frame_id <input id="fid" type="text" placeholder="(base frame)" /></label>
       <div class="row">
-        <button id="btn-capture" class="btn">Capture current</button>
-        <button id="btn-send" class="btn btn-go">Send target</button>
+        <button id="btn-disable" class="btn btn-stop">Stop / Disengage</button>
       </div>
     </section>
 

@@ -1,14 +1,16 @@
 """Launch one ikt_pose_commander instance.
 
-Defaults control the RIGHT arm via its JointTrajectoryController. Override for
-the left arm (or for FPC streaming) on the command line, e.g.::
+By default the node STREAMS to the ``forward_position_controller`` (``command_mode``
+``fpc``): each ``~/target_pose`` is solved by IK and pushed as a joint setpoint to
+``/<fpc_controller>/commands``. The controlled link is chosen at runtime (the
+dashboard or ``~/configure``); the controller is auto-derived from
+``/controller_manager`` unless you PIN its exact name -- via config
+(``ikt_pose_commander:`` section) or the ``fpc_controller`` / ``jtc_controller``
+argument, e.g.::
 
     ros2 launch ikt_pose_commander commander.launch.py \
-        instance_name:=left \
-        controlled_frame:=left_arm_Link7 \
-        jtc_controller:=left_arm_joint_trajectory_controller \
-        fpc_controller:=left_arm_forward_position_controller \
-        joints:="['left_arm_joint1','left_arm_joint2','left_arm_joint3','left_arm_joint4','left_arm_joint5','left_arm_joint6','left_arm_joint7']"
+        fpc_controller:=forward_position_controller \
+        controlled_frame:=left_arm_Link7 instance_name:=left
 
 The node starts DISABLED; call its ``~/enable`` service to allow motion.
 
@@ -33,7 +35,9 @@ from launch_ros.substitutions import FindPackageShare
 # here: it defaults empty and is chosen at runtime (dashboard or ~/configure),
 # auto-derived from the URDF + /controller_manager.
 _FALLBACKS = {
-    "command_mode": "jtc",
+    "command_mode": "fpc",
+    "jtc_controller": "",
+    "fpc_controller": "",
     "start_enabled": "false",
     "base_frame": "",
     "switch_controllers": "true",
@@ -70,8 +74,13 @@ def generate_launch_description():
         # Robot-specific: empty => start UNCONFIGURED, pick the link at runtime
         # (dashboard / ~/configure); joints + controllers are auto-derived.
         DeclareLaunchArgument("controlled_frame", default_value=""),
-        DeclareLaunchArgument("jtc_controller", default_value=""),
-        DeclareLaunchArgument("fpc_controller", default_value=""),
+        # Controller names: "" = auto-derive from /controller_manager by matching
+        # the controlled link's joints. Pin the exact name via the central
+        # config (ikt_pose_commander: section) or these arguments.
+        DeclareLaunchArgument("jtc_controller",
+                              default_value=str(d["jtc_controller"])),
+        DeclareLaunchArgument("fpc_controller",
+                              default_value=str(d["fpc_controller"])),
         DeclareLaunchArgument("joints", default_value="['']"),
         # Robot-neutral, from central config:
         DeclareLaunchArgument("command_mode",

@@ -27,7 +27,7 @@
     controller_manager: "/controller_manager"
 
     # ---- command mode / engagement -------------------------------------
-    command_mode: "jtc"        # "jtc" (safe, discrete) | "fpc" (streaming)
+    command_mode: "fpc"        # "fpc" (stream to FPC, default) | "jtc" (discrete)
     start_enabled: false       # SAFETY: stay disabled until ~/enable
     switch_controllers: true   # activate the mode's controller on enable
 

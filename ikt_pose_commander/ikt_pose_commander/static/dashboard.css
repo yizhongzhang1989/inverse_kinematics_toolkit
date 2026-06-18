@@ -4,6 +4,10 @@
   --warn: #c9962b; --accent: #2f6fd1; --ok: #2ea043; --bad: #d1242f;
 }
 * { box-sizing: border-box; }
+/* Reliable hide for the simplified dashboard: overrides author display (grid/flex)
+   so the `hidden` attribute always collapses an element. Hidden items stay in the
+   DOM (the JS still updates them) and can be deleted later after review. */
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; overflow: hidden; }
 body {
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -71,9 +75,10 @@ input, select {
 .btn:hover { border-color: var(--accent); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .btn.sm { padding: 6px 9px; font-weight: 500; }
+.btn.sm.sel { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn-go { background: var(--go); border-color: var(--go); }
 .btn-stop { background: var(--stop); border-color: var(--stop); }
-#btn-configure, #btn-enable, #btn-disable, #btn-send { flex: 1; min-width: 90px; }
+#btn-configure, #btn-disable { flex: 1; min-width: 90px; }
 
 .jog { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; max-width: 220px; }
 

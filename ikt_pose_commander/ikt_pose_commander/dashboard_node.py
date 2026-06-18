@@ -438,6 +438,11 @@ class CommanderDashboard(Node):
             except Exception:  # noqa: BLE001
                 out["joint_limits"] = {}
             out["controlled_frame"] = (s or {}).get("controlled_frame")
+            # Name of the model root frame (frames[0] is "universe"); the 3D
+            # gizmo sends targets expressed in this frame so they map 1:1 to
+            # the canvas, which renders link transforms in the root frame.
+            fn = model.frame_names()
+            out["root_frame"] = fn[1] if len(fn) > 1 else ""
         return out
 
     def _controlled_frame(self) -> Optional[str]:
@@ -452,7 +457,7 @@ class CommanderDashboard(Node):
         validates and applies them live or structurally). ``controlled_frame``
         is only needed for the initial group setup; live tunables (stiffness
         preset, allow_unreachable, speed/step limits, safety_radius_m,
-        control_rate_hz, tool offset, ...) can be sent on their own -> full
+        control_rate_hz, ...) can be sent on their own -> full
         dashboard parity with the topic/param/service path.
         """
         if not isinstance(cfg, dict) or not cfg:
@@ -492,20 +497,7 @@ class CommanderDashboard(Node):
 
     def capture(self, timeout: float = 2.0
                 ) -> Tuple[Optional[list], Optional[list]]:
-        """Look up the controlled frame's current pose in base_frame.
-
-        When a tool offset is active the solve/tool tip is a virtual frame (not
-        in TF), so use the commander's reported tip pose (``current_ee`` /
-        ``current_ee_quat``) -> capture returns the TOOL pose.
-        """
-        with self._lock:
-            s = self._status or {}
-        solve_frame = s.get("solve_frame")
-        cf = s.get("controlled_frame")
-        if solve_frame and cf and solve_frame != cf:
-            ce, cq = s.get("current_ee"), s.get("current_ee_quat")
-            if ce and cq:
-                return list(ce), list(cq)
+        """Look up the controlled frame's current pose in base_frame."""
         frame = self._controlled_frame()
         if frame is None:
             return None, None
@@ -523,7 +515,8 @@ class CommanderDashboard(Node):
                 time.sleep(0.05)
         return None, None
 
-    def send_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
+    def _build_target_msg(self, xyz: list, quat: list, frame_id: str
+                          ) -> PoseStamped:
         m = PoseStamped()
         m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = frame_id or self._base_frame
@@ -533,10 +526,26 @@ class CommanderDashboard(Node):
         m.pose.orientation.x = float(quat[1])
         m.pose.orientation.y = float(quat[2])
         m.pose.orientation.z = float(quat[3])
+        return m
+
+    def send_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
+        m = self._build_target_msg(xyz, quat, frame_id)
         # publish a few times so a just-matched subscriber surely receives it
         for _ in range(3):
             self._target_pub.publish(m)
             time.sleep(0.02)
+        return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
+                                    m.pose.position.z], "frame_id": m.header.frame_id}
+
+    def stream_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
+        """Publish ONE target setpoint (fast path for live gizmo dragging).
+
+        Unlike ``send_pose`` (which repeats for delivery reliability on a
+        one-shot send), this publishes a single message with no sleep so it can
+        be called at the gizmo drag rate; the next frame re-sends anyway.
+        """
+        m = self._build_target_msg(xyz, quat, frame_id)
+        self._target_pub.publish(m)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}
 
@@ -631,6 +640,15 @@ class CommanderDashboard(Node):
                     b = self._read_json()
                     try:
                         out = dash.send_pose(b["xyz"], b.get(
+                            "quat", [1, 0, 0, 0]), b.get("frame_id", ""))
+                    except Exception as exc:  # noqa: BLE001
+                        return self._send(200, json.dumps(
+                            {"ok": False, "message": f"bad request: {exc}"}))
+                    return self._send(200, json.dumps(out))
+                if path == "/api/target":
+                    b = self._read_json()
+                    try:
+                        out = dash.stream_pose(b["xyz"], b.get(
                             "quat", [1, 0, 0, 0]), b.get("frame_id", ""))
                     except Exception as exc:  # noqa: BLE001
                         return self._send(200, json.dumps(

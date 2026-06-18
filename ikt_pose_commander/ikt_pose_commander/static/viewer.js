@@ -12,12 +12,12 @@
 //   * a "mesh" toggle (solid meshes vs. link-frame skeleton);
 //   * per-link name labels (HTML overlay, toggle);
 //   * per-link coordinate frames (toggle);
-//   * click-to-select a link in 3D — highlights it and fills the
-//     controlled-link dropdown;
+//   * highlights the controlled link (selected from the panel dropdown);
 //   * a live joint-angle panel and a controlled-frame TCP-pose panel.
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
 
 const $ = (id) => document.getElementById(id);
 const DEG = 180 / Math.PI;
@@ -88,15 +88,9 @@ function readOpts() {
 // ---- selection (synced with the controlled-link dropdown) ---------------
 let selectedLink = "";
 function dropdown() { return $("link-select"); }
-function setSelected(link, pushToDropdown) {
+function setSelected(link) {
   selectedLink = link || "";
-  if ($("sel-link")) $("sel-link").textContent = selectedLink || "—";
-  if (pushToDropdown) {
-    const dd = dropdown();
-    if (dd && [...dd.options].some((o) => o.value === selectedLink)) {
-      if (dd.value !== selectedLink) { dd.value = selectedLink; dd.dispatchEvent(new Event("change")); }
-    }
-  }
+  if ($("sel-link")) $("sel-link").textContent = selectedLink || "\u2014";
 }
 
 function getGeom(url, cb) {
@@ -176,13 +170,6 @@ function getLabelDiv(i) {
   if (labelPool[i]) return labelPool[i];
   const d = document.createElement("div");
   d.className = "lbl";
-  d.addEventListener("pointerdown", (e) => {
-    e.stopPropagation();
-    const links = d._links || [];
-    if (!links.length) return;
-    const idx = links.indexOf(selectedLink);
-    setSelected(links[(idx + 1) % links.length], true);   // cycle within cluster
-  });
   labelPool[i] = d; if (labelsEl) labelsEl.appendChild(d);
   return d;
 }
@@ -214,7 +201,6 @@ function placeLabels(linkTf) {
   let i = 0;
   for (; i < clusters.length; i++) {
     const c = clusters[i]; const d = getLabelDiv(i);
-    d._links = c.links;
     d.textContent = c.links.join(", ");
     d.style.display = "block";
     d.style.left = c.x.toFixed(0) + "px";
@@ -285,23 +271,161 @@ function fitView(linkTf) {
   resetView(linkTf); didFit = true;
 }
 
-// ---- click-to-select a link (raycast) -----------------------------------
-const raycaster = new THREE.Raycaster();
-const ndc = new THREE.Vector2();
-let downXY = null;
-canvas.addEventListener("pointerdown", (e) => { downXY = [e.clientX, e.clientY]; });
-canvas.addEventListener("pointerup", (e) => {
-  if (!downXY) return;
-  const moved = Math.hypot(e.clientX - downXY[0], e.clientY - downXY[1]);
-  downXY = null;
-  if (moved > 5) return;                       // it was an orbit drag, not a click
-  const r = canvas.getBoundingClientRect();
-  ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
-  ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
-  raycaster.setFromCamera(ndc, camera);
-  const solids = Object.values(meshItems).map((it) => it.solid).filter((m) => m && m.visible);
-  const hit = raycaster.intersectObjects(solids, false)[0];
-  if (hit && hit.object.userData.link) setSelected(hit.object.userData.link, true);
+// ---- target frame + drag gizmo (the goal pose for the controlled link) ----
+// A Three.js TransformControls handle on a VISIBLE "target proxy" frame. Drag it
+// (move / rotate) to set the goal pose; it does NOT follow the link or command
+// the robot on its own. "Snap target -> link" resets it onto the controlled
+// link's current pose. The robot is commanded explicitly from the Engage panel:
+//   * Snap robot  -> configure JTC + enable + ONE move to the target frame.
+//   * Track robot -> configure FPC + enable + live-stream the target frame
+//                    (dragging then drives the robot continuously). Toggle off /
+//                    Stop disengages.
+const targetProxy = new THREE.Object3D();
+targetProxy.add(new THREE.AxesHelper(0.16));   // the visible target frame
+scene.add(targetProxy);
+const gizmo = new TransformControls(camera, renderer.domElement);
+gizmo.setSize(0.9);
+// LOCAL space: the move/rotate handles align with the target frame's own axes
+// (which equal the controlled link's axes after a snap), so rotating the target
+// matches the link instead of the world axes.
+gizmo.setSpace("local");
+gizmo.attach(targetProxy);
+scene.add(gizmo);
+
+let tracking = false;        // FPC live-align active (Track robot)
+let controlledFrame = "";    // commander's current controlled_frame
+let rootFrame = "";          // model root frame name (target frame_id)
+let _proxyInit = false;      // target frame placed at least once
+let _lastStreamT = 0;
+const STREAM_MIN_MS = 40;    // throttle live FPC streaming to ~25 Hz
+
+gizmo.addEventListener("dragging-changed", (e) => {
+  controls.enabled = !e.value;                 // don't orbit while dragging a handle
+  if (!e.value && tracking) sendProxyTarget(true);   // final pose on release while tracking
+});
+gizmo.addEventListener("objectChange", () => {
+  if (!tracking) return;                        // dragging commands the robot only while tracking
+  const now = performance.now();
+  if (now - _lastStreamT >= STREAM_MIN_MS) { _lastStreamT = now; sendProxyTarget(true); }
+});
+
+function setProxyFromMat(m4) {
+  rosMat(m4).decompose(targetProxy.position, targetProxy.quaternion, targetProxy.scale);
+  targetProxy.scale.set(1, 1, 1);
+  targetProxy.updateMatrixWorld(true);
+  _proxyInit = true;
+}
+
+async function api(url, body) {
+  try {
+    const r = await fetch(url, body !== undefined
+      ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+      : undefined);
+    return await r.json();
+  } catch (e) { return { ok: false, message: String(e) }; }
+}
+const gizmoPost = (url, body) => api(url, body || {});
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function actionMsg(t) { const am = $("action-msg"); if (am) am.textContent = t || ""; }
+
+const _gp = new THREE.Vector3(), _gq = new THREE.Quaternion(), _gscl = new THREE.Vector3();
+function targetPoseBody() {
+  targetProxy.updateMatrixWorld(true);
+  targetProxy.matrixWorld.decompose(_gp, _gq, _gscl);
+  // three Quaternion is (x,y,z,w); the commander wants (w,x,y,z)
+  return { xyz: [_gp.x, _gp.y, _gp.z], quat: [_gq.w, _gq.x, _gq.y, _gq.z], frame_id: rootFrame || "" };
+}
+function sendProxyTarget(stream) {
+  api(stream ? "/api/target" : "/api/send", targetPoseBody()).then((out) => {
+    if (out && out.ok === false) actionMsg("target failed: " + (out.message || ""));
+  });
+}
+
+// "Snap target -> link": move the target frame onto the selected control link.
+function snapTargetToLink() {
+  const link = ($("link-select") && $("link-select").value) || controlledFrame;
+  const tf = window.__lastLinkTf;
+  if (!link || !tf || !tf[link]) { actionMsg("no live pose for '" + (link || "?") + "' yet"); return; }
+  setProxyFromMat(tf[link]);
+  actionMsg("target frame snapped to " + link);
+}
+
+// Ensure the commander is configured for the selected link + mode and enabled.
+// Passes the current controller names so no re-discovery is needed (fast).
+async function engage(mode) {
+  const link = ($("link-select") && $("link-select").value) || controlledFrame;
+  const base = ($("base-select") && $("base-select").value) || "";
+  if (!link) { actionMsg("pick a controlled link first"); return false; }
+  let snap = await api("/api/state");
+  let s = snap && snap.status;
+  const needCfg = !s || !s.configured || s.controlled_frame !== link || s.mode !== mode;
+  if (needCfg) {
+    if (s && s.enabled) await gizmoPost("/api/disable");
+    const cfg = { controlled_frame: link, base_frame: base, command_mode: mode };
+    if (s && s.jtc_controller) cfg.jtc_controller = s.jtc_controller;
+    if (s && s.fpc_controller) cfg.fpc_controller = s.fpc_controller;
+    await gizmoPost("/api/configure", cfg);
+    let ok = false;
+    for (let i = 0; i < 40; i++) {
+      await sleep(100);
+      snap = await api("/api/state"); s = snap && snap.status;
+      if (s && s.configured && s.mode === mode && s.controlled_frame === link) { ok = true; break; }
+    }
+    if (!ok) { actionMsg("configure to " + mode + " failed: " + (s ? s.last_message : "")); return false; }
+  }
+  if (snap && snap.root_frame) rootFrame = snap.root_frame;
+  if (!s.enabled) { const r = await gizmoPost("/api/enable"); if (!r.ok) { actionMsg("enable failed: " + (r.message || "")); return false; } }
+  return true;
+}
+
+async function snapRobot() {
+  actionMsg("Snap: configuring JTC + enabling\u2026");
+  if (!(await engage("jtc"))) return;
+  sendProxyTarget(false);   // one /api/send -> JTC move to the target frame
+  actionMsg("Snap: JTC move to the target frame sent");
+}
+
+function updateTrackBtn() {
+  const b = $("btn-track-robot"); if (!b) return;
+  b.textContent = tracking ? "Stop tracking" : "Track robot (fpc)";
+  b.classList.toggle("btn-stop", tracking);
+  b.classList.toggle("btn-go", !tracking);
+}
+
+async function trackRobot() {
+  if (tracking) { await stopRobot(); return; }
+  actionMsg("Track: configuring FPC + enabling\u2026");
+  if (!(await engage("fpc"))) return;
+  tracking = true; updateTrackBtn();
+  sendProxyTarget(true);    // initial setpoint
+  actionMsg("Tracking: drag the target frame — the robot follows live (FPC)");
+}
+
+async function stopRobot() {
+  tracking = false; updateTrackBtn();
+  await gizmoPost("/api/disable");
+  actionMsg("Stopped / disengaged (holding pose)");
+}
+
+function setGizmoMode(mode) {
+  gizmo.setMode(mode);
+  const mv = $("gizmo-move"), ro = $("gizmo-rotate");
+  if (mv) mv.classList.toggle("sel", mode === "translate");
+  if (ro) ro.classList.toggle("sel", mode === "rotate");
+}
+
+if ($("gizmo-move")) $("gizmo-move").onclick = () => setGizmoMode("translate");
+if ($("gizmo-rotate")) $("gizmo-rotate").onclick = () => setGizmoMode("rotate");
+if ($("btn-snap-target")) $("btn-snap-target").onclick = snapTargetToLink;
+if ($("btn-snap-robot")) $("btn-snap-robot").onclick = snapRobot;
+if ($("btn-track-robot")) $("btn-track-robot").onclick = trackRobot;
+if ($("btn-disable")) $("btn-disable").onclick = stopRobot;
+// When the controlled link changes in the panel dropdown, re-place the target
+// frame onto that link so it starts ALIGNED with it (the link is then driven to
+// "match" the target). Skipped while live-tracking so an active FPC stream isn't
+// yanked to a new pose mid-motion.
+if ($("link-select")) $("link-select").addEventListener("change", () => {
+  if (!tracking && window.__lastLinkTf) snapTargetToLink();
 });
 
 // ---- live target --------------------------------------------------------
@@ -413,7 +537,7 @@ async function poll() {
   readOpts();
   // keep selection in sync if the user changed the dropdown directly
   const dd = dropdown();
-  if (dd && dd.value && dd.value !== selectedLink) setSelected(dd.value, false);
+  if (dd && dd.value && dd.value !== selectedLink) setSelected(dd.value);
 
   if (s.has_model_viz) {
     const ld = $("loading"); if (ld) ld.style.display = "none";
@@ -436,8 +560,20 @@ async function poll() {
     }
     updateJointPanel(s.joints, s.joint_values, s.joint_limits);
     updateTcp(tf, s.controlled_frame);
+    // --- target frame: track names; place the frame ONCE (no auto-follow) ---
+    controlledFrame = s.controlled_frame || "";
+    rootFrame = s.root_frame || rootFrame;
+    const gf = $("grab-frame");
+    if (gf) gf.textContent = controlledFrame ? ("\u00b7 " + controlledFrame) : "";
+    // Place the target frame on the controlled/selected link the FIRST time we
+    // have a pose; afterwards it stays where the user drags it (use
+    // "Snap target -> link" to reset it onto the link again).
+    if (!_proxyInit) {
+      const initLink = controlledFrame || ($("link-select") && $("link-select").value);
+      if (initLink && tf[initLink]) setProxyFromMat(tf[initLink]);
+    }
     // default the selection to the controlled frame the first time we see it
-    if (!selectedLink && s.controlled_frame) setSelected(s.controlled_frame, false);
+    if (!selectedLink && s.controlled_frame) setSelected(s.controlled_frame);
   }
   updateTarget(s.target);
 }

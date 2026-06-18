@@ -93,7 +93,7 @@ matched in `/controller_manager`):
 # via the dashboard: pick the link in the "Configure" dropdown, click Configure
 # or by topic:
 ros2 topic pub --once /ikt_pose_commander/configure std_msgs/msg/String \
-    '{data: "{\"controlled_frame\": \"<your_tip_link>\", \"command_mode\": \"jtc\"}"}'
+    '{data: "{\"controlled_frame\": \"<your_tip_link>\", \"command_mode\": \"fpc\"}"}'
 ```
 
 You may still pin a fixed config at launch (skips the runtime step):
@@ -133,12 +133,25 @@ ros2 service call /ikt_pose_commander_right/disable std_srvs/srv/Trigger
 
 | `command_mode` | path | when |
 |---|---|---|
-| `jtc` (default) | one speed-limited `FollowJointTrajectory` goal per target | safe, discrete moves; first real-robot tests |
-| `fpc` | `Float64MultiArray` to `/<fpc>/commands` per target | continuous servoing / streaming targets |
+| `fpc` (default) | `Float64MultiArray` to `/<fpc_controller>/commands` per target | continuous servoing / a streamed target pose (the normal path) |
+| `jtc` | one speed-limited `FollowJointTrajectory` goal per target | discrete moves; conservative bring-up |
 
-`fpc` streams a setpoint per incoming target (no internal interpolation); it
-relies on the `rm_control` hardware shaper for smoothing and on the jump gate to
-reject discontinuities. Use `jtc` until you need streaming.
+`fpc` is the default: each incoming `~/target_pose` is solved by IK and streamed
+as one joint setpoint to the `forward_position_controller` (no internal
+interpolation), relying on the hardware shaper for smoothing and on the jump gate
+to reject discontinuities — so a **continuous external pose stream drives
+continuous motion**. Switch to `jtc` for discrete, speed-limited trajectory goals.
+
+**Naming the controller.** Both controllers are **auto-derived** from
+`/controller_manager` (matched to the controlled link's joints). To pin the exact
+name instead — e.g. force the precise `forward_position_controller` — set it in
+**config** (the `ikt_pose_commander:` section, key `fpc_controller` /
+`jtc_controller`) **or** pass it as a **launch argument** of the same name:
+
+```bash
+ros2 launch ikt_pose_commander commander.launch.py \
+    fpc_controller:=forward_position_controller   # or jtc_controller:=arm_1_controller
+```
 
 ## Dashboard (optional, independent)
 
@@ -163,6 +176,18 @@ offset → send). Every command still goes through the commander's safety gates,
 so the dashboard cannot bypass reachability / jump / speed limits. Default port
 **8180** (8080/8100/8120/8140/8160 are used by the other toolkit dashboards).
 
+**Interactive 3D manipulation (drag the link to move the robot).** In the 3D
+view you can grab the controlled link and drag it; the commander solves IK and
+drives the robot to follow. Pick a link (click it in 3D, or use the dropdown —
+while the commander is **disabled** this auto-configures it as the controlled
+frame), **Enable**, then tick **grab** to attach a move/rotate handle to the
+link. The **move/rotate** buttons switch the handle mode. Dragging the handle
+sends its pose (expressed in the model root frame) as a target: with **live
+follow** ticked the pose is streamed continuously while you drag (smoothest in
+`fpc` mode); otherwise one target is sent when you release the handle. Every drag
+still passes the reachability / 30 cm Cartesian-envelope / jump / speed gates, so
+it cannot move the link outside the safety sphere captured at `~/enable`.
+
 ## ROS interface
 
 **Subscribes**
@@ -181,8 +206,7 @@ so the dashboard cannot bypass reachability / jump / speed limits. Default port
   (reachable/reason/residual), last step size, freshness, plus the safety/feature
   fields: `safety_radius_m`, `start_ee`, `ee_displacement`, `clamp_scale`,
   `allow_unreachable`, `stiffness_preset`, `reach_gain`, `control_rate_hz`,
-  `best_effort`, `solve_frame`, `tool_offset_xyz/rpy`, `current_ee` (the
-  controlled/tool tip pose, used by the dashboard's tool-aware *Capture*).
+  `best_effort`.
 
 **Actions / services used**
 * `/<jtc_controller>/follow_joint_trajectory` (sends moves in `jtc` mode).
@@ -210,11 +234,10 @@ Keys split by how they apply:
   `joint_centering_weight`, `damping`, `tol_pos`, `tol_ori`, `max_iters`,
   `default_stiffness`, `safety_radius_m`, `allow_unreachable`,
   `stiffness_preset`, `reach_gain`, `control_rate_hz`.
-* **Structural** (change the kinematic group / controllers / tool; **refused
+* **Structural** (change the kinematic group / controllers; **refused
   while enabled** — disable first): `controlled_frame`, `joints`,
-  `jtc_controller`, `fpc_controller`, `command_mode`, `tool_offset_xyz`,
-  `tool_offset_rpy`, `tool_frame_name`. Naming only `controlled_frame` re-derives
-  `joints` + controllers automatically.
+  `jtc_controller`, `fpc_controller`, `command_mode`. Naming only
+  `controlled_frame` re-derives `joints` + controllers automatically.
 
 **New tunables (this revision):**
 
@@ -225,8 +248,6 @@ Keys split by how they apply:
 | `stiffness_preset` | live | `full_pose` \| `position_only` \| `position_yaw` \| `custom`. How hard each DOF reaches; `custom` uses `default_stiffness`. |
 | `reach_gain` | live | (0,1] FPC approach scaling: command `cur + reach_gain·(q_cmd−cur)` for a gradual, smoother stretch (default 1.0). |
 | `control_rate_hz` | live | >0 starts a control loop that re-solves+commands the latest target at this rate (smooth FPC streaming / single-target tracking). 0 = event-driven. Capped at 250 Hz. |
-| `tool_offset_xyz` / `tool_offset_rpy` | structural | a virtual **tool frame** fixed to `controlled_frame`; targets then apply to this offset tip. All-zero clears it. |
-| `tool_frame_name` | structural | name of the virtual tool frame (default `ikt_tool`). |
 
 ```bash
 # set the controlled (target) link and the base reference link at runtime
