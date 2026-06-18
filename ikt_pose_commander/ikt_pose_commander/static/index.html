@@ -98,6 +98,47 @@
       </div>
     </section>
 
+    <!-- IK & motion parameters: every field applies LIVE on change (the
+         commander accepts these even while enabled). base_frame lives in the
+         Configure card above. -->
+    <section class="card">
+      <h2>Parameters <span class="muted">(applied live)</span></h2>
+      <div class="psub">IK solver</div>
+      <label>stiffness preset
+        <select id="p-stiff-preset" data-key="stiffness_preset">
+          <option value="custom">custom (6-vector)</option>
+          <option value="full_pose">full_pose</option>
+          <option value="position_only">position_only</option>
+          <option value="position_yaw">position_yaw</option>
+        </select>
+      </label>
+      <label>custom stiffness [x y z rx ry rz]
+        <input id="p-stiff6" type="text" data-key="default_stiffness" data-vec="1" placeholder="1 1 1 1 1 1" />
+      </label>
+      <label><input type="checkbox" id="p-allow-unreach" data-key="allow_unreachable"> allow_unreachable (best-effort stretch)</label>
+      <div class="row3">
+        <label>reach gain <input id="p-reach-gain" type="number" data-key="reach_gain" step="0.05" min="0.001" max="1" /></label>
+        <label>centering wt <input id="p-centering" type="number" data-key="joint_centering_weight" step="0.005" min="0" /></label>
+        <label>damping <input id="p-damping" type="number" data-key="damping" step="0.005" min="0" /></label>
+      </div>
+      <div class="row3">
+        <label>tol pos (m) <input id="p-tol-pos" type="number" data-key="tol_pos" step="0.0005" min="0" /></label>
+        <label>tol ori (rad) <input id="p-tol-ori" type="number" data-key="tol_ori" step="0.0005" min="0" /></label>
+        <label>max iters <input id="p-max-iters" type="number" data-key="max_iters" data-int="1" step="10" min="1" /></label>
+      </div>
+      <div class="psub">Motion &amp; safety</div>
+      <div class="row3">
+        <label>max joint speed <input id="p-max-speed" type="number" data-key="max_joint_speed" step="0.05" min="0.001" /></label>
+        <label>min move time (s) <input id="p-min-time" type="number" data-key="min_move_time" step="0.1" min="0" /></label>
+        <label>max step (rad) <input id="p-max-step" type="number" data-key="max_step_rad" step="0.05" min="0" /></label>
+      </div>
+      <div class="row3">
+        <label>stale after (s) <input id="p-js-stale" type="number" data-key="joint_states_stale_after" step="0.1" min="0" /></label>
+        <label>safety radius (m) <input id="p-safety-radius" type="number" data-key="safety_radius_m" step="0.05" min="0" /></label>
+        <label>control rate (Hz) <input id="p-control-rate" type="number" data-key="control_rate_hz" step="5" min="0" max="250" /></label>
+      </div>
+    </section>
+
     <div class="msg" id="action-msg"></div>
   </div>
 

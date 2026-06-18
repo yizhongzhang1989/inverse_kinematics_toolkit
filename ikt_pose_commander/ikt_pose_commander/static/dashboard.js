@@ -80,6 +80,8 @@ async function poll() {
     bsel.value = (b && b !== "(model root)" && links.includes(b)) ? b
       : (cur && links.includes(cur)) ? cur : "";
   }
+
+  initParams(s);
 }
 
 // ---- Configure: apply the picked controlled + base link ------------------
@@ -92,10 +94,58 @@ async function doConfigure() {
   poll();
 }
 
+// ---- IK / motion parameters (live: each change is applied immediately) ----
+// Every input in the Parameters card carries data-key=<commander param>. Read
+// its value by type and relay just that key to ~/configure (a _LIVE_KEY, so it
+// applies even while enabled).
+function paramValue(el) {
+  if (el.type === "checkbox") return el.checked;
+  if (el.dataset.vec) {
+    const p = (el.value || "").trim().split(/[\s,]+/).map(Number);
+    return (p.length === 6 && p.every((x) => !Number.isNaN(x))) ? p : null;
+  }
+  if (el.tagName === "SELECT") return el.value;
+  if (el.type === "number") {
+    const v = el.dataset.int ? parseInt(el.value, 10) : parseFloat(el.value);
+    return Number.isNaN(v) ? null : v;
+  }
+  return el.value;
+}
+
+async function onParamChange(el) {
+  const key = el.dataset.key;
+  const val = paramValue(el);
+  if (val === null) { setMsg("invalid value for " + key); return; }
+  const out = await postJSON("/api/configure", { [key]: val });
+  setMsg(out.ok ? ("set " + key) : ("set " + key + " failed: " + (out.message || "")));
+}
+
+// Populate the parameter inputs ONCE from the live status, then leave them to
+// the user (the 400 ms refresh must never wipe what is being typed).
+let _paramsInit = false;
+function initParams(s) {
+  if (_paramsInit || !s) return;
+  let any = false;
+  document.querySelectorAll("[data-key]").forEach((el) => {
+    const v = s[el.dataset.key];
+    if (v === undefined || v === null) return;
+    if (el.type === "checkbox") el.checked = !!v;
+    else if (el.dataset.vec) el.value = Array.isArray(v) ? v.join(" ") : String(v);
+    else el.value = v;
+    any = true;
+  });
+  if (any) _paramsInit = true;
+}
+
 // ---- wire up --------------------------------------------------------------
 // The control link is chosen ONLY in the panel; Snap/Track (viewer.js)
 // auto-configure + enable, so Configure is just an explicit pre-configure.
 $("btn-configure").onclick = doConfigure;
+
+// IK / motion parameter inputs: apply each one live on change.
+document.querySelectorAll("[data-key]").forEach((el) => {
+  el.addEventListener("change", () => onParamChange(el));
+});
 
 // kick off polling: connection pill + link/base dropdowns every 400 ms (the 3D
 // viewer polls the scene separately).

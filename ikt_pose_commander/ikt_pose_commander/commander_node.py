@@ -191,6 +191,13 @@ class PoseCommander(Node):
         self._joints = [str(j) for j in (gp("joints").value or []) if str(j)]
         self._jtc = str(gp("jtc_controller").value or "")
         self._fpc = str(gp("fpc_controller").value or "")
+        # Full ordered joint list each controller drives (>= self._joints). Read
+        # from the controller_manager at configure time so FPC/JTC commands are
+        # always full-width: a sub-group like link_4 (4 joints) otherwise sends a
+        # short array/goal the 6-joint controller drops/rejects -> no motion. The
+        # joints outside the controlled group are held at their current position.
+        self._jtc_joints: List[str] = []
+        self._fpc_joints: List[str] = []
         self._mode = str(gp("command_mode").value).strip().lower()
         self._do_switch = bool(gp("switch_controllers").value)
         self._cm = str(gp("controller_manager").value or "/controller_manager")
@@ -689,10 +696,17 @@ class PoseCommander(Node):
             return False, ("no ForwardCommandController found driving %s; "
                            "set fpc_controller explicitly" % joints)
 
+        # Full joint set each controller drives, so FPC/JTC commands can span it
+        # (holding the joints outside the controlled sub-group at current pos).
+        cj = self._controller_joint_map()
+        fpc_joints = cj.get(fpc, []) if fpc else []
+        jtc_joints = cj.get(jtc, []) if jtc else []
+
         with self._lock:
             self._model = model
             self._frame, self._joints = frame, joints
             self._jtc, self._fpc, self._mode = jtc, fpc, mode
+            self._jtc_joints, self._fpc_joints = jtc_joints, fpc_joints
             self._configured = True
             # The captured start pose / motion envelope belonged to the previous
             # group; invalidate it so it is re-captured on the next ~/enable (and
@@ -735,6 +749,33 @@ class PoseCommander(Node):
             elif t.endswith("ForwardCommandController") and cover > best["fpc"]:
                 best["fpc"] = cover
                 out["fpc"] = ctl.name
+        return out
+
+    def _controller_joint_map(self) -> Dict[str, List[str]]:
+        """{controller: [ordered joints it position-commands]} from the CM.
+
+        Lets FPC/JTC commands span a controller's FULL joint set even when only
+        a sub-group is controlled (the extra joints are held). The order matches
+        the controller's command-interface order == its command-array order.
+        """
+        out: Dict[str, List[str]] = {}
+        if not _HAS_CM or self._cli_list is None:
+            return out
+        if not self._cli_list.wait_for_service(timeout_sec=2.0):
+            return out
+        fut = self._cli_list.call_async(ListControllers.Request())
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=2.0):
+            return out
+        resp = fut.result()
+        for ctl in getattr(resp, "controller", []):
+            js = [itf[:-len("/position")]
+                  for itf in (getattr(ctl, "required_command_interfaces", [])
+                              or [])
+                  if itf.endswith("/position")]
+            if js:
+                out[ctl.name] = js
         return out
 
     def _rebuild_clients(self) -> None:
@@ -1012,7 +1053,19 @@ class PoseCommander(Node):
         if self._jtc_client is None:
             self._set_msg("cannot command: FollowJointTrajectory unavailable")
             return
-        data = [float(q_cmd[j]) for j in self._joints]
+        # Command the controller's FULL joint set: solved values for the
+        # controlled sub-group, current position (hold) for the rest. A 6-joint
+        # JTC rejects a partial-joint goal, so a sub-group (e.g. link_4) would
+        # otherwise never move.
+        with self._lock:
+            ctrl_joints = list(self._jtc_joints) or list(self._joints)
+            controlled = set(self._joints)
+            cur = {j: self._joint_pos.get(j) for j in ctrl_joints}
+            last = self._last_jtc_cmd
+            rate = self._control_rate
+        data = [float(q_cmd[j]) if (j in controlled and j in q_cmd)
+                else float(cur[j] if cur[j] is not None else q_cmd.get(j, 0.0))
+                for j in ctrl_joints]
         # Deadband (control-loop only): don't re-send a goal for an unchanged
         # solved config (would restart the same trajectory every tick). In
         # event-driven mode every target is intentional, so always send.
@@ -1032,7 +1085,7 @@ class PoseCommander(Node):
             self._last_jtc_cmd = data
         duration = max(self._min_time, max_delta / self._max_speed)
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = list(self._joints)
+        goal.trajectory.joint_names = list(ctrl_joints)
         pt = JointTrajectoryPoint()
         pt.positions = data
         pt.time_from_start.sec = int(duration)
@@ -1059,17 +1112,29 @@ class PoseCommander(Node):
     def _command_fpc(self, q_cmd: Dict[str, float],
                      best_effort: bool = False) -> None:
         with self._lock:
-            cur = {j: self._joint_pos.get(j) for j in self._joints}
+            ctrl_joints = list(self._fpc_joints) or list(self._joints)
+            controlled = set(self._joints)
+            cur = {j: self._joint_pos.get(j) for j in ctrl_joints}
             gain = self._reach_gain
             last = self._last_fpc_cmd
             rate = self._control_rate
+        # Command the controller's FULL joint set: solved values for the
+        # controlled sub-group, current position (hold) for the rest. The
+        # ForwardCommandController drops a command whose width != its joint
+        # count, so a sub-group (e.g. link_4) would otherwise never move.
         # Approach scaling (Req 5): a gradual step toward the target per cycle
-        # for smoother stretching. gain=1.0 (default) sends the full step.
-        if 0.0 < gain < 1.0 and all(cur[j] is not None for j in self._joints):
-            data = [float(cur[j] + gain * (q_cmd[j] - cur[j]))
-                    for j in self._joints]
-        else:
-            data = [float(q_cmd[j]) for j in self._joints]
+        # (gain=1.0 default = full step), applied to the controlled joints.
+        use_gain = 0.0 < gain < 1.0 and all(
+            cur[j] is not None for j in ctrl_joints if j in controlled)
+        data = []
+        for j in ctrl_joints:
+            if j in controlled and j in q_cmd:
+                v = float(q_cmd[j])
+                if use_gain and cur[j] is not None:
+                    v = float(cur[j] + gain * (v - cur[j]))
+            else:
+                v = float(cur[j] if cur[j] is not None else q_cmd.get(j, 0.0))
+            data.append(v)
         # Deadband: in EVENT-DRIVEN mode skip republishing an unchanged setpoint
         # (anti-chatter; the controller latches it). Under a control loop
         # (rate>0) keep streaming so the FPC input stays fed at the loop rate.
@@ -1168,12 +1233,13 @@ class PoseCommander(Node):
 
     def _seed_fpc_current(self) -> None:
         with self._lock:
-            cur = {j: self._joint_pos.get(j) for j in self._joints}
+            ctrl_joints = list(self._fpc_joints) or list(self._joints)
+            cur = {j: self._joint_pos.get(j) for j in ctrl_joints}
             pub = self._fpc_pub
-        if pub is None or any(cur[j] is None for j in self._joints):
+        if pub is None or any(cur[j] is None for j in ctrl_joints):
             return
         m = Float64MultiArray()
-        m.data = [float(cur[j]) for j in self._joints]
+        m.data = [float(cur[j]) for j in ctrl_joints]
         pub.publish(m)
 
     def _srv_return_to_start(self, request, response):
@@ -1331,6 +1397,8 @@ class PoseCommander(Node):
             reason = self._last_reason
             frame, joints = self._frame, list(self._joints)
             jtc, fpc, mode = self._jtc, self._fpc, self._mode
+            cmd_joints = list(self._fpc_joints if mode == "fpc"
+                              else self._jtc_joints)
             safety_radius = self._safety_radius
             control_rate = self._control_rate
             start_ee = (self._start_ee_xyz.tolist()
@@ -1348,6 +1416,7 @@ class PoseCommander(Node):
             "controlled_frame": frame,
             "base_frame": self._base_frame or "(model root)",
             "joints": joints,
+            "command_joints": cmd_joints,
             "jtc_controller": jtc,
             "fpc_controller": fpc,
             "have_model": model is not None,
@@ -1358,6 +1427,13 @@ class PoseCommander(Node):
             "max_step_rad": self._max_step,
             "max_joint_speed": self._max_speed,
             "min_move_time": self._min_time,
+            "joint_states_stale_after": self._js_stale,
+            "default_stiffness": list(self._stiffness),
+            "joint_centering_weight": self._centering,
+            "damping": self._damping,
+            "tol_pos": self._tol_pos,
+            "tol_ori": self._tol_ori,
+            "max_iters": self._max_iters,
             "safety_radius_m": safety_radius,
             "control_rate_hz": control_rate,
             "start_ee": start_ee,

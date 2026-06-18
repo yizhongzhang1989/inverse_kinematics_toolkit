@@ -79,6 +79,8 @@ input, select {
 .btn-go { background: var(--go); border-color: var(--go); }
 .btn-stop { background: var(--stop); border-color: var(--stop); }
 #btn-configure, #btn-disable { flex: 1; min-width: 90px; }
+.psub { margin: 12px 0 4px; font-size: 11px; font-weight: 600; letter-spacing: .05em;
+        text-transform: uppercase; color: var(--accent); opacity: .85; }
 
 .jog { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; max-width: 220px; }
 
