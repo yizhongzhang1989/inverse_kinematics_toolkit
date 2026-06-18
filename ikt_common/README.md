@@ -1,12 +1,13 @@
 # `ikt_common`
 
 Centralized configuration loader and workspace utilities for the
-**cartesian_controllers_toolkit**. Every other package in the toolkit should
+**inverse_kinematics_toolkit** (and reusable by any other toolkit dropped into
+the same workspace). Every other package in the toolkit should
 read its parameters through `ikt_common.config_manager.ConfigManager` so
 there is exactly one source of truth (`config/robot_config.yaml`) for
 IPs, ports, device paths, robot kinematics, etc.
 
-> Named `ikt_common` (cartesian_controllers_toolkit common) rather than
+> Named `ikt_common` (inverse-kinematics-toolkit common) rather than
 > `common` so the toolkit can be added to any workspace as a git submodule
 > without its support package colliding with a host package named `common`.
 

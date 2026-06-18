@@ -134,21 +134,34 @@ for all joints.
    `/joint_states` (any robot's `robot_state_publisher` + driver). Or skip the
    topic and pass the model directly:
    `ros2 launch ikt_inverse_kinematics ik.launch.py urdf_file:=/path/my_robot.urdf`.
-2. **Controllers (only for motion).** Load a `JointTrajectoryController` and/or a
-   `forward_command_controller` for your joints in `/controller_manager`. The
-   commander **auto-discovers** them by matching `<joint>/position` command
-   interfaces — controllers may be named anything (see
+2. **Controllers (only for motion).** Load a `JointTrajectoryController` (for
+   `jtc` mode) and/or a forward **position** controller — a
+   `forward_command_controller/ForwardCommandController` **or** a
+   `position_controllers/JointGroupPositionController` (for `fpc` mode) — for your
+   joints in `/controller_manager`. The commander **auto-discovers** them by
+   matching `<joint>/position` command interfaces and prefers an **active**
+   controller; names don't matter (see
    [`ikt_pose_commander`](ikt_pose_commander/README.md)).
 3. **Solve / visualize:** `ros2 launch ikt_inverse_kinematics ik_with_dashboard.launch.py`
    → open http://localhost:8160, pick any link, Solve. (Advisory; never moves the robot.)
 4. **Move:** `ros2 launch ikt_pose_commander commander.launch.py dashboard_port:=8180`
    → open http://localhost:8180, **Configure** the link to control (joints +
-   controllers auto-derive), **Enable**, then jog / send a target.
+   controllers auto-derive), then **Snap robot** (one JTC move) or **Track robot**
+   (drag the 3D gizmo — live FPC). FPC streaming is smoothed by a fixed-rate
+   (200 Hz) acceleration-limited loop. Starts **disabled**; every move is gated
+   by a Cartesian envelope + jump/speed limits.
 5. **Optional — arm-angle (7-DOF S-R-S) redundancy.** Only this feature needs
    per-robot frame names. Set `srs_chain_names` + `srs_chains.<name>.{shoulder,
    elbow,wrist}` in your `robot_config.yaml` (template in
    [`ikt_inverse_kinematics/config/ik_defaults.yaml`](ikt_inverse_kinematics/config/ik_defaults.yaml)).
    Everything else works without it.
+
+**Multiple arms.** Run **one `ikt_pose_commander` instance per arm**, each with a
+distinct `instance_name:=<arm>` (node/namespace suffix) and `dashboard_port:=`,
+configured to that arm's tip link. All instances share the one
+`/robot_description` + `/joint_states`; controllers auto-derive per arm, so each
+arm needs its **own** controller set. See
+[`ikt_pose_commander` → Multiple arms](ikt_pose_commander/README.md#multiple-arms).
 
 **Requirements:** the URDF needs movable (revolute/prismatic) joints to the link
 you target; continuous joints are treated as unlimited. Mesh-free URDFs are
@@ -161,5 +174,7 @@ by link-name prefix — both are just UI defaults you can override in the dropdo
 
 `ikt_inverse_kinematics` is **advisory only**: it publishes IK *results*, never
 controller commands. Actuation happens solely through `ikt_pose_commander`,
-which starts disabled and enforces reachability, per-step jump, joint-speed and
-staleness gates before any motion.
+which starts disabled and enforces a **Cartesian motion envelope** (a radius
+around the pose captured at enable), per-step jump, joint-speed and staleness
+gates before any motion; its FPC output is **acceleration-limited at a fixed rate**
+(default 200 Hz) for smooth, jerk-free streaming.

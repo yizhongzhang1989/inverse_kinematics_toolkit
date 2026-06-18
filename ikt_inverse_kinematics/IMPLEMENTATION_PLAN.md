@@ -1,10 +1,13 @@
 # `ikt_inverse_kinematics` — Implementation Plan
 
-> Status: **DESIGN / NOT YET IMPLEMENTED**. This document is the build spec for a
-> future session. It describes a new ROS 2 (Humble) package to live in the
-> `cartesian_controllers_toolkit` submodule.
+> Status: **IMPLEMENTED** — this was the original build spec (design session
+> 2026-06-11); the package it describes now exists and ships. Kept only for
+> **design rationale** (the R1–R9 / E1–E4 feature reasoning). For what actually
+> exists and how to run it, read [`README.md`](README.md). NOTE: paths below
+> reference the old `cartesian_controllers_toolkit` location; the code now lives
+> in the `inverse_kinematics_toolkit` submodule.
 >
-> Author of plan: design session 2026-06-11. Target implementer: a follow-up session.
+> Author of plan: design session 2026-06-11.
 
 ---
 
