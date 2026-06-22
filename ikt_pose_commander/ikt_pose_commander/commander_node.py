@@ -921,12 +921,16 @@ class PoseCommander(Node):
         Shared by the event-driven path (``_on_target``) and the control-loop
         timer (``_control_tick``). Re-seeds from the current joints each call.
 
-        Goal caching (FPC control loop only): the solved + gated controlled-joint
-        goal is cached and REUSED while the target pose is essentially unchanged,
-        so the redundant 7-DOF IK is solved once per target rather than every
-        tick. Re-solving each tick let the solution drift in the null space,
-        which made the end-effector shake around the target; caching gives one
-        stable goal the synchronized streamer drives to in a straight line.
+        Goal caching (control loop, FPC AND JTC): the solved + gated
+        controlled-joint goal is cached and REUSED while the target pose is
+        essentially unchanged, so the redundant 7-DOF IK is solved once per
+        target rather than every tick. Re-solving each tick let the solution
+        drift in the null space; in FPC that made the end-effector shake around
+        the target, and in JTC it made each tick re-send a slightly different
+        ``FollowJointTrajectory`` goal that preempted the in-flight trajectory
+        (the arm kept re-aiming mid-move -> shaking). Caching gives one stable
+        goal: FPC streams to it in a straight line; JTC sends it once and the
+        trajectory controller executes it without interruption.
         """
         with self._lock:
             rate = self._control_rate
@@ -937,11 +941,15 @@ class PoseCommander(Node):
             best_effort_cached = self._last_best_effort
             rej_xyz = self._rejected_target_xyz
             rej_quat = self._rejected_target_quat
-        # Cache hit: same target, FPC control loop, already solved+gated -> just
-        # keep streaming toward the cached goal (no re-solve, no null-space drift).
-        if (rate > 0.0 and mode == "fpc" and cached_goal is not None
+        # Cache hit: same target, already solved + gated under the control loop.
+        # FPC keeps streaming toward the cached goal (no re-solve, no null-space
+        # drift). JTC does NOTHING: the trajectory controller is already
+        # executing/holding the cached goal, and re-sending would restart the
+        # trajectory and cause shaking.
+        if (rate > 0.0 and cached_goal is not None
                 and not self._target_moved(xyz, quat, c_xyz, c_quat)):
-            self._command_fpc(cached_goal, best_effort_cached)
+            if mode == "fpc":
+                self._command_fpc(cached_goal, best_effort_cached)
             return
 
         # Rejection cache hit: the same target was just refused. Re-processing it
@@ -986,8 +994,9 @@ class PoseCommander(Node):
 
         # --- Cartesian safety gate (Phase 0) -----------------------------
         # Keep the controlled frame inside the sphere captured at ~/enable.
-        # JTC rejects an out-of-sphere target; FPC clamps the joint step so the
-        # frame lands on the boundary. Independent of reachability.
+        # BOTH modes clamp the joint step so the frame lands on the sphere
+        # boundary (the arm stretches to the closest point toward an
+        # out-of-envelope / unreachable target). Independent of reachability.
         ok, q_full, gate_msg = self._apply_cartesian_gate(model, seed, q_full)
         if not ok:
             with self._lock:
@@ -1008,27 +1017,37 @@ class PoseCommander(Node):
             self._last_delta = max_delta
             mode = self._mode
             rate = self._control_rate
-        # Jump protection. Under the FPC control loop (control_rate_hz>0) the
-        # step is instead velocity-limited and interpolated in _command_fpc
-        # (smooth ramp toward the goal), so the hard reject applies only to JTC
-        # and event-driven FPC.
-        interpolated_fpc = (mode == "fpc" and rate > 0.0)
-        if max_delta > self._max_step and not interpolated_fpc:
+        # Jump protection guards the EVENT-DRIVEN path (control_rate_hz=0), where
+        # a target is commanded in one shot with no velocity limiting. Under the
+        # control loop (rate>0) BOTH modes are inherently speed-limited, so a
+        # large step (e.g. a best-effort / envelope-clamped stretch toward an
+        # unreachable target, which near a singularity needs a big joint move for
+        # a small Cartesian one) executes as a slow, smooth, bounded trajectory
+        # rather than a dangerous instant jump:
+        #   * FPC ramps to the goal via the synchronized accel-limited generator;
+        #   * JTC sends ONE FollowJointTrajectory whose duration scales with the
+        #     joint delta (max(min_move_time, max_delta/max_joint_speed)).
+        # The Cartesian envelope already bounds the EE to safety_radius_m either
+        # way. So the hard reject applies only when the control loop is off.
+        speed_limited = rate > 0.0
+        if max_delta > self._max_step and not speed_limited:
             self._set_msg(
                 "target REJECTED: step %.3f rad > max_step_rad %.3f "
                 "(jump protection)" % (max_delta, self._max_step))
             return
 
+        # Cache the solved + gated goal so subsequent control-loop ticks for this
+        # same target reuse it (no re-solve, no null-space wander). Applies to
+        # both modes: FPC streams toward it; JTC sends it once and then the cache
+        # hit above suppresses re-sends until the target actually moves.
+        with self._lock:
+            self._cached_goal = dict(q_cmd)
+            self._cached_target_xyz = np.asarray(xyz, dtype=float)
+            self._cached_target_quat = (None if quat is None
+                                        else np.asarray(quat, dtype=float))
         if mode == "jtc":
             self._command_jtc(q_cmd, max_delta, best_effort)
         else:
-            # Cache the solved + gated goal so subsequent ticks for this same
-            # target reuse it (no re-solve, no null-space wander).
-            with self._lock:
-                self._cached_goal = dict(q_cmd)
-                self._cached_target_xyz = np.asarray(xyz, dtype=float)
-                self._cached_target_quat = (None if quat is None
-                                            else np.asarray(quat, dtype=float))
             self._command_fpc(q_cmd, best_effort)
 
     def _target_moved(self, xyz, quat, c_xyz, c_quat,
@@ -1060,10 +1079,10 @@ class PoseCommander(Node):
 
         Returns ``(ok, q_out, reject_msg)``. With no start pose captured or a
         non-positive radius it is a no-op. Within the sphere it passes the
-        configuration through. Outside: JTC returns ``ok=False`` (reject); FPC
-        clamps the joint step so the frame lands on the boundary and returns the
-        scaled configuration. Updates ``_last_ee_disp`` / ``_last_clamp_scale``
-        for status either way.
+        configuration through. Outside, BOTH modes clamp the joint step so the
+        controlled frame lands on the sphere boundary (move to the closest point
+        within the envelope) and return the scaled configuration. Updates
+        ``_last_ee_disp`` / ``_last_clamp_scale`` for status either way.
         """
         with self._lock:
             start = self._start_ee_xyz
@@ -1079,14 +1098,14 @@ class PoseCommander(Node):
                 self._last_ee_disp = d
                 self._last_clamp_scale = 1.0
             return True, q_full, ""
-        if mode == "jtc":
-            with self._lock:
-                self._last_ee_disp = d
-                self._last_clamp_scale = 0.0
-            return False, q_full, (
-                "target REJECTED: EE %.3f m exceeds safety_radius_m %.3f "
-                "(30 cm envelope)" % (d, radius))
-        # fpc: clamp the step toward the sphere boundary
+        # Outside the envelope: CLAMP the joint step so the controlled frame
+        # lands on the sphere boundary -> the arm moves to the CLOSEST point
+        # within the envelope. Applied in BOTH modes so JTC behaves like FPC:
+        # an unreachable / out-of-envelope (or being-edited) target makes the
+        # arm stretch toward it, up to the 0.30 m bound, instead of refusing to
+        # move. The clamped config is a valid joint goal -- FPC streams to it;
+        # JTC sends it as one speed-limited trajectory -- and the hard 0.30 m
+        # bound is preserved either way.
         with self._fk_lock:
             q_out, scale, d_cl = clamp_config_to_sphere(
                 model, seed, q_full, frame, start, radius)
@@ -1094,8 +1113,8 @@ class PoseCommander(Node):
             self._last_ee_disp = d_cl
             self._last_clamp_scale = scale
         self.get_logger().warn(
-            "[commander] EE clamp: %.3f -> %.3f m (scale %.2f, radius %.2f)"
-            % (d, d_cl, scale, radius))
+            "[commander] EE clamp (%s): %.3f -> %.3f m (scale %.2f, radius %.2f)"
+            % (mode, d, d_cl, scale, radius))
         return True, q_out, ""
 
     def _build_seed(self, model: "RobotModel") -> np.ndarray:

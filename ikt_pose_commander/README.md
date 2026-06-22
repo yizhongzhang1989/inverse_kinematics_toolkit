@@ -13,9 +13,9 @@ PoseStamped ──▶ (TF→base) ──▶ ikt_inverse_kinematics solve ──�
    ~/target_pose                 (per-DOF stiffness, limits,        │            │
                                   rest posture, reachability)       │            ├─ jtc: one speed-limited
                                                                     │            │   FollowJointTrajectory goal
-                                            reject if: disabled,     │            └─ fpc: Float64MultiArray
-                                            unreachable, jump >       │                stream to /commands
-                                            max_step, stale state ───┘
+                                       hold if disabled / stale;     │            └─ fpc: Float64MultiArray
+                                       CLAMP step to the 30 cm        │                stream to /commands
+                                       envelope (both modes) ────────┘
 ```
 
 ## Why a node, not a `ros2_control` controller
@@ -44,18 +44,24 @@ shaper.
   unreachable solutions and hold position until the target becomes reachable again.
 * **30 cm Cartesian envelope (`safety_radius_m`, default 0.30):** on `~/enable`
   the controlled frame's pose is captured as the **start**; thereafter every
-  command is checked: in `jtc` a target whose predicted EE leaves the sphere is
-  **rejected**; in `fpc` the joint step is **clamped** so the EE lands on the
-  sphere boundary. Runs *regardless of* reachability — it is the primary
-  software bound on motion.
+  command is checked: in **both** `jtc` and `fpc` the joint step is **clamped**
+  so the EE lands on the sphere boundary — the arm moves to the **closest point**
+  toward an out-of-envelope / unreachable target rather than refusing to move.
+  Runs *regardless of* reachability — it is the primary software bound on motion.
 * **Measured-TCP watchdog (independent backstop):**
   [`tools/ikt_safety_watchdog.py`](../../../tools/ikt_safety_watchdog.py) reads
   the **real** TCP at ≥5 Hz and calls `~/disable` if it leaves the sphere (fails
   safe on read errors too). Run it for every real-robot test.
 * **Return-to-start:** `~/return_to_start` (Trigger) commands a JTC move back to
   the captured start pose and waits for completion — use it between tests.
-* **Jump protection:** a solve whose max joint change from the *current measured*
-  pose exceeds `max_step_rad` is rejected.
+* **Jump protection (event-driven path only):** when the control loop is off
+  (`control_rate_hz=0`), a solve whose max joint change from the *current
+  measured* pose exceeds `max_step_rad` is rejected. Under the control loop
+  (default 200 Hz) **both** modes are inherently speed-limited — FPC ramps via
+  the synchronized accel-limited generator; JTC sends one `FollowJointTrajectory`
+  whose duration scales with the joint delta — so a large (e.g. best-effort,
+  envelope-clamped) step executes as a slow, smooth, bounded trajectory instead
+  of being rejected. The Cartesian envelope still bounds the EE either way.
 * **Speed limiting (JTC):** every move's duration is
   `max(min_move_time, max_joint_delta / max_joint_speed)`.
 * **Stale-input hold:** no command if `/joint_states` is stale or no model yet.
@@ -162,7 +168,15 @@ hold, and an unchanged *unreachable* target is likewise not re-solved every tick
 does no interpolation, so a sparse external pose stream (e.g. a ~25 Hz dashboard
 drag) is up-sampled into smooth 200 Hz motion. Set `control_rate_hz:=0` for the
 legacy event-driven path (one setpoint per received target, no interpolation).
-Switch to `jtc` for discrete, speed-limited `FollowJointTrajectory` goals.
+
+Switch to `jtc` for discrete, speed-limited `FollowJointTrajectory` goals. The
+**same per-target goal cache** applies here: under the control loop a held target
+is solved once and the trajectory is sent **once**, then re-sends are suppressed
+until the target actually moves. Without it, re-solving every tick on a redundant
+arm produced tiny null-space-different goals that **preempted the in-flight
+trajectory** each tick — the controller kept restarting the move and the arm
+**shook**. With the cache, JTC sends one clean trajectory per target (Snap = one
+move) and holds.
 
 **Naming the controller.** Both controllers are **auto-derived** from
 `/controller_manager` by matching the controlled link's joints to a controller's
@@ -374,8 +388,14 @@ See [config/commander_defaults.yaml](config/commander_defaults.yaml). Most-used:
   ROS mock + live arm: straight joint-space path, zero arrival spread, zero
   settling chatter, IK goal cached per target (no null-space drift). Best-effort
   reach (`allow_unreachable`) defaults **on** here so the arm keeps tracking an
-  out-of-reach or being-edited target. Unit tests:
-  [`test/test_trajectory.py`](test/test_trajectory.py).
+  out-of-reach or being-edited target. The per-target **goal cache** applies to
+  **both** FPC and JTC: in JTC mode a held target is sent as **one** trajectory
+  (not re-sent every control tick), which fixed a separate JTC-only shaking from
+  null-space-different goals preempting the in-flight trajectory. The Cartesian
+  envelope **clamps** in both modes (not reject-for-JTC), and jump protection is
+  scoped to the event-driven path, so JTC also **moves to the closest point**
+  toward an unreachable target (one speed-limited best-effort trajectory),
+  matching FPC. Unit tests: [`test/test_trajectory.py`](test/test_trajectory.py).
 * **Dashboard** (independent HTTP/ROS client, port 8180) — Configure / Target
   frame gizmo / Snap-Track engage / live Parameters, validated on both robots.
 * Not yet: dual-arm **relative-pose** commanding (one object held by two arms —
