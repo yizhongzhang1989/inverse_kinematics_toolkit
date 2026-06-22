@@ -81,7 +81,68 @@ async function poll() {
       : (cur && links.includes(cur)) ? cur : "";
   }
 
+  // Per-joint "fixed" checkboxes: one row per movable joint in the live URDF.
+  // Checked = held OUT of the IK (e.g. a lifter). Rebuild only when the joint
+  // set changes (so the 400 ms refresh never fights a click). Each refresh
+  // re-syncs the checked state to the commander's current fixed_joints unless
+  // the user is mid-edit (a pending apply).
+  const joints = s.available_joints || [];
+  const fjHost = $("fixed-joints-list");
+  if (fjHost && joints.length && fjHost.dataset.count != String(joints.length)) {
+    fjHost.innerHTML = "";
+    joints.forEach((j, i) => {
+      const id = "fj-" + i;
+      const row = document.createElement("label");
+      row.className = "fj-row";
+      row.innerHTML =
+        `<input type="checkbox" id="${id}" value="${j}">`
+        + `<span class="fj-name">${j}</span>`
+        + `<span class="fj-tag" hidden>FIXED</span>`;
+      const cb = row.querySelector("input");
+      cb.addEventListener("change", () => onFixedToggle());
+      fjHost.appendChild(row);
+    });
+    fjHost.dataset.count = String(joints.length);
+  }
+  if (fjHost && !fjHost.dataset.editing) {
+    const fixed = new Set(s.fixed_joints || []);
+    fjHost.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+      cb.checked = fixed.has(cb.value);
+      const tag = cb.parentElement.querySelector(".fj-tag");
+      if (tag) tag.hidden = !cb.checked;
+      cb.parentElement.classList.toggle("is-fixed", cb.checked);
+    });
+  }
+
   initParams(s);
+}
+
+function fixedJointsSelected() {
+  const fjHost = $("fixed-joints-list");
+  if (!fjHost) return [];
+  return Array.from(fjHost.querySelectorAll("input[type=checkbox]:checked"))
+    .map((cb) => cb.value);
+}
+
+// Toggle a joint's fixed state immediately (fixed_joints is structural -> the
+// commander applies it while DISABLED and refuses while enabled). We send the
+// full set and let the next poll re-sync the checkboxes to the real state.
+async function onFixedToggle() {
+  const fjHost = $("fixed-joints-list");
+  if (fjHost) fjHost.dataset.editing = "1";   // pause refresh-resync briefly
+  // reflect the tag immediately for snappy feedback
+  fjHost.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+    const tag = cb.parentElement.querySelector(".fj-tag");
+    if (tag) tag.hidden = !cb.checked;
+    cb.parentElement.classList.toggle("is-fixed", cb.checked);
+  });
+  const fixed = fixedJointsSelected();
+  const out = await postJSON("/api/configure", { fixed_joints: fixed });
+  setMsg((out.ok ? "fixed joints: " : "fixed joints FAILED: ")
+    + (fixed.length ? fixed.join(", ") : "none")
+    + (out.message ? " — " + out.message : ""));
+  setTimeout(() => { if (fjHost) delete fjHost.dataset.editing; }, 800);
+  poll();
 }
 
 // ---- Configure: apply the picked controlled + base link ------------------
@@ -89,7 +150,8 @@ async function doConfigure() {
   const link = $("link-select").value;
   if (!link) { setMsg("pick a controlled link first"); return; }
   const out = await postJSON("/api/configure",
-    { controlled_frame: link, base_frame: $("base-select").value });
+    { controlled_frame: link, base_frame: $("base-select").value,
+      fixed_joints: fixedJointsSelected() });
   setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
   poll();
 }

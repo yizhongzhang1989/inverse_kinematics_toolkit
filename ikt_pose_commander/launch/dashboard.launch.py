@@ -13,7 +13,7 @@ toolkit's centralized config (``ikt_pose_commander:`` in
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 _FALLBACKS = {"dashboard_port": 8180, "dashboard_base_frame": "base_link"}
@@ -38,6 +38,10 @@ def generate_launch_description():
         DeclareLaunchArgument("port", default_value=str(d["dashboard_port"])),
         DeclareLaunchArgument("commander_ns",
                               default_value="/ikt_pose_commander"),
+        # Empty => single/default dashboard named ``ikt_pose_commander_dashboard``.
+        # Set (e.g. ``left``/``right``) for multi-arm setups so each dashboard
+        # gets a UNIQUE ROS node name and they don't collide on one name.
+        DeclareLaunchArgument("instance_name", default_value=""),
         DeclareLaunchArgument("base_frame",
                               default_value=str(d["dashboard_base_frame"])),
     ]
@@ -45,7 +49,10 @@ def generate_launch_description():
     node = Node(
         package="ikt_pose_commander",
         executable="dashboard_node",
-        name="ikt_pose_commander_dashboard",
+        name=PythonExpression(
+            ["'ikt_pose_commander_dashboard' + ('_' + '",
+             LaunchConfiguration("instance_name"),
+             "' if '", LaunchConfiguration("instance_name"), "' else '')"]),
         output="screen",
         parameters=[{
             "port": LaunchConfiguration("port"),

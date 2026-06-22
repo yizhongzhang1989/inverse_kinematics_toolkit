@@ -69,8 +69,10 @@ const geomCache = {};   // url -> {geom, waiting:[cb]}
 const meshItems = {};   // key(link#i) -> {link, local, solid}
 const frameAxes = {};   // link -> AxesHelper
 const labelPool = [];   // reusable label divs (clustered, not per-link)
+const fixedLabelPool = []; // reusable divs for the "FIXED" joint markers
 let allLinks = [];      // link names from the snapshot
-let jointTree = [];     // [{parent, child, type}] for the skeleton lines
+let jointTree = [];     // [{parent, child, name, type}] for skeleton + fixed markers
+let fixedJoints = [];   // joint names currently held out of the IK (commander)
 let didFit = false;
 
 // ---- view options (checkboxes) ------------------------------------------
@@ -208,6 +210,41 @@ function placeLabels(linkTf) {
     d.classList.toggle("sel", c.links.includes(selectedLink));
   }
   for (; i < labelPool.length; i++) labelPool[i].style.display = "none";
+}
+
+// ---- "FIXED" markers for joints held out of the IK ----------------------
+// For each fixed joint, place a distinct amber badge at its child link's origin
+// (the joint's location), so the operator sees on the 3D canvas exactly which
+// joints are frozen. Independent of the link-name label clustering above; it
+// tracks the camera every frame like the other labels.
+function getFixedLabelDiv(i) {
+  if (fixedLabelPool[i]) return fixedLabelPool[i];
+  const d = document.createElement("div");
+  d.className = "lbl fixed";
+  fixedLabelPool[i] = d; if (labelsEl) labelsEl.appendChild(d);
+  return d;
+}
+const _fv = new THREE.Vector3();
+function placeFixedLabels(linkTf) {
+  if (!labelsEl) return;
+  let i = 0;
+  if (opt.labels && fixedJoints.length && jointTree.length) {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    for (const jn of fixedJoints) {
+      const je = jointTree.find((j) => j.name === jn);
+      const child = je && je.child;
+      const lm = child && linkTf[child];
+      if (!lm) continue;
+      _fv.set(lm[0][3], lm[1][3], lm[2][3]).project(camera);
+      if (_fv.z > 1) continue;   // behind camera
+      const d = getFixedLabelDiv(i++);
+      d.textContent = "\uD83D\uDD12 " + jn + " · FIXED";   // lock glyph
+      d.style.display = "block";
+      d.style.left = ((_fv.x * 0.5 + 0.5) * w).toFixed(0) + "px";
+      d.style.top = ((-_fv.y * 0.5 + 0.5) * h).toFixed(0) + "px";
+    }
+  }
+  for (; i < fixedLabelPool.length; i++) fixedLabelPool[i].style.display = "none";
 }
 
 // ---- skeleton (joint-connectivity lines + link dots) --------------------
@@ -545,9 +582,10 @@ async function poll() {
     window.__hasMeshes = !!s.has_meshes;
     allLinks = s.links || Object.keys(tf);
     jointTree = s.joint_tree || [];
+    fixedJoints = (s.status && s.status.fixed_joints) || [];
     if (s.has_meshes) ensureMeshes(s.visuals || []);
     ensureFrames(tf);
-    placeCurrent(tf); placeFrames(tf); placeLabels(tf);
+    placeCurrent(tf); placeFrames(tf); placeLabels(tf); placeFixedLabels(tf);
     updateSkeleton(tf, !opt.mesh || !s.has_meshes);
     fitView(tf);
     window.__lastLinkTf = tf;
@@ -601,5 +639,5 @@ function resizeToDisplay() {
   requestAnimationFrame(animate);
   resizeToDisplay(); controls.update(); renderer.render(scene, camera);
   // labels track the camera every frame (cheap; ~9 divs)
-  if (window.__lastLinkTf) placeLabels(window.__lastLinkTf);
+  if (window.__lastLinkTf) { placeLabels(window.__lastLinkTf); placeFixedLabels(window.__lastLinkTf); }
 })();

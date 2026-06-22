@@ -238,7 +238,9 @@ instance per arm**, distinguished by `instance_name`. Each instance:
 
 * is named `ikt_pose_commander_<instance_name>` (node + namespace), so its
   topics/services live under `/ikt_pose_commander_<name>/...`;
-* gets its own dashboard on its own `dashboard_port`;
+* gets its own dashboard on its own `dashboard_port`, named
+  `ikt_pose_commander_dashboard_<instance_name>` so multiple dashboards never
+  collide on one ROS node name;
 * reads the **same** shared `/robot_description` + `/joint_states`, and is
   configured to that arm's tip link — the joints (kinematic path to the tip) and
   the JTC/FPC controllers auto-derive per arm.
@@ -268,6 +270,28 @@ own `~/enable`, so the arms are independently gated. Coordinated *relative-pose*
 bimanual commanding (two arms rigidly holding one object) is a separate,
 not-yet-wired feature — see the roadmap.
 
+## Fixing joints (extra DOFs, e.g. a lifter / torso)
+
+Not every joint on the path to the tip belongs to the arm IK. A torso-lift,
+column, or rail joint is often on the kinematic chain but driven **separately**.
+List such joints in **`fixed_joints`** and the commander holds them **out of the
+IK**: they keep their current measured value while the arm solves *around* them,
+and controller auto-discovery then matches the **arm-only** joint set (so it
+finds the arm controller, not a non-existent arm+lifter one).
+
+* **At launch:** `... commander.launch.py controlled_frame:=arm_tip
+  fixed_joints:="['torso_lift_joint']"`
+* **Live / on the dashboard:** it is a **structural** key (applies while
+  **disabled** — disable first if enabled). The **Configure** card lists every
+  movable joint with a **checkbox**; tick a joint to freeze it (it shows a
+  **FIXED** tag and the joint gets an amber **🔒 FIXED** marker on the 3D canvas
+  at that joint's location). Untick to release. Equivalent to
+  `ros2 param set <ns> fixed_joints "['torso_lift_joint']"` or a `~/configure`
+  JSON.
+
+The status reports `group_joints` (full chain), `fixed_joints` (held), and
+`joints` (the active set the IK actually solves = group − fixed).
+
 ## ROS interface
 
 **Subscribes**
@@ -283,7 +307,9 @@ not-yet-wired feature — see the roadmap.
 **Publishes**
 * `/<fpc_controller>/commands` (`std_msgs/Float64MultiArray`) — in `fpc` mode.
 * `~/status` (`std_msgs/String` JSON) — enabled, mode, controlled/base frame,
-  `joints` + `command_joints` (the full controller joint set), last message, last
+  `joints` (active, IK-solved) + `fixed_joints` (held out of the IK) +
+  `group_joints` (the full kinematic group = active ∪ fixed) + `command_joints`
+  (the full controller joint set), last message, last
   solve (reachable/reason/residual), last step size, freshness, the live tunables
   (`max_joint_speed`, `max_joint_accel`, `control_rate_hz`, `max_step_rad`,
   tolerances, …), the safety/feature fields (`safety_radius_m`, `start_ee`,
@@ -319,13 +345,14 @@ Keys split by how they apply:
   `allow_unreachable`, `stiffness_preset`, `reach_gain`, `control_rate_hz`.
 * **Structural** (change the kinematic group / controllers; **refused
   while enabled** — disable first): `controlled_frame`, `joints`,
-  `jtc_controller`, `fpc_controller`, `command_mode`. Naming only
+  `fixed_joints`, `jtc_controller`, `fpc_controller`, `command_mode`. Naming only
   `controlled_frame` re-derives `joints` + controllers automatically.
 
 **New tunables (this revision):**
 
 | key | kind | meaning |
 |---|---|---|
+| `fixed_joints` | structural | joint names the IK must **not** move (held at their current value), e.g. a lifter/torso joint on the path to the arm tip that is driven separately. Filtered out of the active joint group, so the solver freezes them and the arm solves **around** them; controller auto-discovery then matches the arm-only set. Empty = none. Settable at launch (`fixed_joints:="['torso_lift_joint']"`), via `~/configure` / `ros2 param set`, and on the dashboard (per-joint checkboxes in the Configure card; fixed joints also get a **🔒 FIXED** marker on the 3D canvas). |
 | `safety_radius_m` | live | radius (m) of the Cartesian motion envelope around the start pose (default 0.30). |
 | `allow_unreachable` | live | `true` (**default**) = best-effort: command the closest config and *stretch toward* unreachable / still-being-edited targets. `false` = reject unreachable solutions and hold position until the target is reachable again. |
 | `stiffness_preset` | live | `full_pose` \| `position_only` \| `position_yaw` \| `custom`. How hard each DOF reaches; `custom` uses `default_stiffness`. |

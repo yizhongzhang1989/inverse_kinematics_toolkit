@@ -84,6 +84,10 @@ def generate_launch_description():
         DeclareLaunchArgument("fpc_controller",
                               default_value=str(d["fpc_controller"])),
         DeclareLaunchArgument("joints", default_value="['']"),
+        # fixed_joints: joints held OUT of the IK (e.g. a lifter/torso joint on
+        # the path to the tip that is driven separately). Empty = none fixed.
+        # e.g.  fixed_joints:="['torso_lift_joint']"
+        DeclareLaunchArgument("fixed_joints", default_value="['']"),
         # Robot-neutral, from central config:
         DeclareLaunchArgument("command_mode",
                               default_value=str(d["command_mode"])),
@@ -131,6 +135,7 @@ def generate_launch_description():
             "start_enabled": LaunchConfiguration("start_enabled"),
             "base_frame": LaunchConfiguration("base_frame"),
             "joints": LaunchConfiguration("joints"),
+            "fixed_joints": LaunchConfiguration("fixed_joints"),
             "switch_controllers": LaunchConfiguration("switch_controllers"),
             "controller_manager": LaunchConfiguration("controller_manager"),
             "max_joint_speed": LaunchConfiguration("max_joint_speed"),
@@ -151,6 +156,9 @@ def generate_launch_description():
             "launch", "dashboard.launch.py"])),
         launch_arguments={
             "port": LaunchConfiguration("dashboard_port"),
+            # Suffix the dashboard node name with the instance so multiple arms
+            # don't collide on one ROS node name (mirrors the commander node).
+            "instance_name": LaunchConfiguration("instance_name"),
             "commander_ns": PythonExpression(
                 ["'/ikt_pose_commander' + ('_' + '",
                  LaunchConfiguration("instance_name"),

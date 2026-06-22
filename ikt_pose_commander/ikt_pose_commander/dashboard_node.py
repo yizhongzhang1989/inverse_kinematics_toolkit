@@ -141,6 +141,7 @@ def parse_joint_tree(urdf_xml: str) -> List[dict]:
         pl, cl = p.get("link"), c.get("link")
         if pl and cl:
             out.append({"parent": pl, "child": cl,
+                        "name": j.get("name", ""),
                         "type": j.get("type", "fixed")})
     return out
 

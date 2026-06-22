@@ -107,8 +107,8 @@ _LIVE_KEYS = (
     "control_rate_hz",
 )
 _STRUCTURAL_KEYS = (
-    "controlled_frame", "joints", "jtc_controller", "fpc_controller",
-    "command_mode",
+    "controlled_frame", "joints", "fixed_joints", "jtc_controller",
+    "fpc_controller", "command_mode",
 )
 
 # Valid stiffness presets (Req 5: "how hard each DOF reaches the target").
@@ -150,6 +150,14 @@ class PoseCommander(Node):
         # also works.
         self.declare_parameter("controlled_frame", "")
         self.declare_parameter("joints", [""])
+        # fixed_joints: joints the IK must NOT move (held at their current
+        # measured value), e.g. a lifter/torso joint that is on the kinematic
+        # path to the arm tip but is driven separately. They are filtered out of
+        # the active joint group, so the solver freezes them and the arm solves
+        # AROUND them; controller auto-discovery then matches the arm-only set.
+        # Settable at launch, via ~/configure / ros2 param set, and the dashboard
+        # (structural -> applied while disabled). Empty = none fixed.
+        self.declare_parameter("fixed_joints", [""])
         self.declare_parameter("jtc_controller", "")
         self.declare_parameter("fpc_controller", "")
         self.declare_parameter("command_mode", "fpc")          # fpc | jtc
@@ -209,6 +217,13 @@ class PoseCommander(Node):
         # Active config (may start empty -> unconfigured). Filled by _apply_config.
         self._frame = str(gp("controlled_frame").value or "")
         self._joints = [str(j) for j in (gp("joints").value or []) if str(j)]
+        # Joints frozen out of the IK (held at current value). See the param doc.
+        self._fixed_joints = [str(j) for j in (gp("fixed_joints").value or [])
+                              if str(j)]
+        # The full kinematic group BEFORE fixing (so toggling fixed_joints is
+        # reversible without losing the original joint set). self._joints is
+        # always self._group_joints minus self._fixed_joints.
+        self._group_joints: List[str] = []
         self._jtc = str(gp("jtc_controller").value or "")
         self._fpc = str(gp("fpc_controller").value or "")
         # Full ordered joint list each controller drives (>= self._joints). Read
@@ -282,6 +297,12 @@ class PoseCommander(Node):
         self._last_fpc_cmd: Optional[List[float]] = None
         self._last_best_effort = False
         self._last_jtc_cmd: Optional[List[float]] = None
+        # Frozen hold angles for fixed_joints: the CONSTANT value each held
+        # joint is commanded at (captured when it is fixed, refreshed on
+        # ~/enable). Commanding the live measured value instead would let
+        # encoder noise leak through the synchronized FPC generator and make a
+        # "fixed" joint slowly creep -- and the arm never settle. Joint -> rad.
+        self._fixed_hold: Dict[str, float] = {}
         # Velocity-limited FPC stream setpoint (full ctrl-joint width). Under a
         # control loop (control_rate_hz>0) each tick advances this toward the IK
         # goal by at most max_joint_speed/rate per joint -> a smooth interpolated
@@ -325,6 +346,7 @@ class PoseCommander(Node):
         if self._frame:
             self._req_cfg = {"controlled_frame": self._frame,
                              "joints": self._joints or None,
+                             "fixed_joints": self._fixed_joints or None,
                              "jtc_controller": self._jtc or None,
                              "fpc_controller": self._fpc or None,
                              "command_mode": self._mode}
@@ -504,8 +526,10 @@ class PoseCommander(Node):
 
         Live tunables apply immediately; structural params are staged and
         applied by the status timer (so we never block on controller discovery
-        inside this callback), and are rejected while enabled to keep the
-        parameter store consistent with the active config.
+        inside this callback). Structural changes are rejected while enabled to
+        keep the parameter store consistent with the active config — EXCEPT a
+        ``fixed_joints``-only change, which is applied live (it keeps the
+        controllers + safety envelope), mirroring the ``~/configure`` topic.
         """
         live: dict = {}
         structural: dict = {}
@@ -517,11 +541,14 @@ class PoseCommander(Node):
         if structural:
             with self._lock:
                 enabled = self._enabled
-            if enabled:
+            # ``fixed_joints`` alone is safe while enabled (applied live below);
+            # any other structural key requires disabling first.
+            non_live_structural = [k for k in structural if k != "fixed_joints"]
+            if enabled and non_live_structural:
                 return SetParametersResult(
                     successful=False,
                     reason="disable before changing structural config (%s)"
-                    % ", ".join(sorted(structural)))
+                    % ", ".join(sorted(non_live_structural)))
         if live:
             m = self._apply_live(live)
             if m:
@@ -682,21 +709,85 @@ class PoseCommander(Node):
         self._process_target(model, tgt[0], tgt[1])
 
     def _apply_structural(self, req: dict):
-        """Apply a kinematic-group / controller reconfig. Refused while enabled.
+        """Apply a kinematic-group / controller reconfig.
 
         Selects the control link (``controlled_frame``), derives the joints, and
         picks the JTC/FPC controllers. ``joints`` and controller names are
-        auto-derived when omitted.
+        auto-derived when omitted. A general reconfig is **refused while enabled**
+        (disable first), but a change to **only** ``fixed_joints`` is applied
+        **live** (see below) since it keeps the controllers + safety envelope.
         """
         with self._lock:
-            if self._enabled:
-                return False, "refused: disable before reconfiguring"
+            enabled = self._enabled
             urdf = self._urdf
             cur_frame, cur_joints = self._frame, list(self._joints)
+            cur_group = list(self._group_joints)
+            cur_fixed = list(self._fixed_joints)
             cur_jtc, cur_fpc, cur_mode = self._jtc, self._fpc, self._mode
             cur_configured = self._configured
         if not urdf or RobotModel is None:
             return False, "no model yet"
+
+        # Fast path: a change to ONLY ``fixed_joints`` (no frame/group/controller/
+        # mode change) keeps the controlled frame, the controllers, and the
+        # Cartesian safety envelope identical — it just freezes/releases joints
+        # within the SAME group. So it is applied **live, even while enabled**: we
+        # re-derive the active set and drop the motion caches so the next target
+        # re-solves around the newly fixed joints, without dropping engagement.
+        # (Any other structural change still requires disabling first.)
+        fixed_only = ("fixed_joints" in req and not any(
+            k in req for k in ("controlled_frame", "joints", "jtc_controller",
+                               "fpc_controller", "command_mode")))
+        if fixed_only and cur_configured and cur_frame:
+            try:
+                model = RobotModel(urdf)
+            except Exception as exc:  # noqa: BLE001
+                return False, "model build failed: %r" % exc
+            fixed = [str(j) for j in (req.get("fixed_joints") or []) if str(j)]
+            missing = [j for j in fixed if j not in model.joint_names]
+            if missing:
+                return False, f"fixed_joints not in URDF: {missing}"
+            group = cur_group or model.supporting_joints(cur_frame)
+            fixed_set = set(fixed)
+            joints = [j for j in group if j not in fixed_set]
+            if not joints:
+                return False, ("all joints in the group are fixed "
+                               "(group=%s, fixed=%s)" % (group, fixed))
+            with self._lock:
+                self._model = model
+                self._joints = joints
+                self._group_joints = group
+                self._fixed_joints = fixed
+                # Freeze each fixed joint at a CONSTANT angle: keep the existing
+                # freeze point for joints already held, capture the current
+                # measured angle for newly fixed ones, drop released joints.
+                self._fixed_hold = {
+                    j: (self._fixed_hold[j] if j in self._fixed_hold
+                        else float(self._joint_pos[j]))
+                    for j in fixed
+                    if j in self._fixed_hold or j in self._joint_pos}
+                # Re-solve the current target against the new active set: drop the
+                # goal/rejection cache + FPC stream so the next tick re-seeds from
+                # the current joints and solves with the joint(s) now frozen.
+                self._cached_goal = None
+                self._cached_target_xyz = None
+                self._cached_target_quat = None
+                self._rejected_target_xyz = None
+                self._rejected_target_quat = None
+                self._traj = None
+                if not self._enabled:
+                    # disabled: re-capture the start pose on the next ~/enable.
+                    self._start_q = None
+                    self._start_ee_xyz = None
+            fixed_on_path = [j for j in fixed if j in group]
+            return True, (
+                "fixed=%d joints=%d (live%s; controllers + envelope unchanged)"
+                % (len(fixed_on_path), len(joints),
+                   ", enabled" if enabled else ""))
+
+        # General reconfig (frame / group / controllers / mode): disabled only.
+        if enabled:
+            return False, "refused: disable before reconfiguring"
 
         changing_group = ("controlled_frame" in req) or ("joints" in req)
         if changing_group:
@@ -715,28 +806,51 @@ class PoseCommander(Node):
         if not model.has_frame(frame):
             return False, f"unknown link/frame '{frame}'"
 
-        # joints: explicit > derived from the control link > kept
-        joints = req.get("joints")
-        if joints:
-            joints = [str(j) for j in joints if str(j)]
-            missing = [j for j in joints if j not in model.joint_names]
+        # group_joints = the FULL kinematic group BEFORE fixing:
+        #   explicit ``joints`` > derived from the control link > kept.
+        group = req.get("joints")
+        if group:
+            group = [str(j) for j in group if str(j)]
+            missing = [j for j in group if j not in model.joint_names]
             if missing:
                 return False, f"joints not in URDF: {missing}"
-        elif changing_group or not cur_joints:
-            joints = model.supporting_joints(frame)
-            if not joints:
+        elif changing_group or not cur_group:
+            group = model.supporting_joints(frame)
+            if not group:
                 return False, f"no movable joints support frame '{frame}'"
         else:
-            joints = cur_joints
+            group = cur_group
+
+        # fixed_joints = joints held OUT of the IK: explicit in req > kept.
+        fixing = "fixed_joints" in req
+        if fixing:
+            fixed = [str(j) for j in (req.get("fixed_joints") or []) if str(j)]
+            missing = [j for j in fixed if j not in model.joint_names]
+            if missing:
+                return False, f"fixed_joints not in URDF: {missing}"
+        else:
+            fixed = cur_fixed
+        fixed_set = set(fixed)
+
+        # Active controlled joints = group minus the fixed ones. The IK solves
+        # only these; the fixed joints stay at their current measured value and
+        # the arm solves around them.
+        joints = [j for j in group if j not in fixed_set]
+        if not joints:
+            return False, ("all joints in the group are fixed "
+                           "(group=%s, fixed=%s)" % (group, fixed))
 
         mode = str(req.get("command_mode") or cur_mode).strip().lower()
         if mode not in ("jtc", "fpc"):
             return False, "command_mode must be 'jtc' or 'fpc'"
 
-        # controllers: explicit > kept (only if the group is unchanged) > derived
+        # controllers: explicit > kept (only if the active set is unchanged) >
+        # derived. Re-derive when the group OR the fixed set changed, since that
+        # changes which joints the controller must drive.
+        group_or_fix_changed = changing_group or fixing
         jtc = str(req.get("jtc_controller") or "")
         fpc = str(req.get("fpc_controller") or "")
-        if not changing_group:
+        if not group_or_fix_changed:
             jtc = jtc or cur_jtc
             fpc = fpc or cur_fpc
         if not jtc or not fpc:
@@ -759,6 +873,15 @@ class PoseCommander(Node):
         with self._lock:
             self._model = model
             self._frame, self._joints = frame, joints
+            self._group_joints, self._fixed_joints = group, fixed
+            # Freeze each fixed joint at a CONSTANT angle (see _fixed_hold):
+            # keep existing freeze points, capture the current measured angle
+            # for newly fixed joints, drop released ones.
+            self._fixed_hold = {
+                j: (self._fixed_hold[j] if j in self._fixed_hold
+                    else float(self._joint_pos[j]))
+                for j in fixed
+                if j in self._fixed_hold or j in self._joint_pos}
             self._jtc, self._fpc, self._mode = jtc, fpc, mode
             self._jtc_joints, self._fpc_joints = jtc_joints, fpc_joints
             self._configured = True
@@ -768,7 +891,9 @@ class PoseCommander(Node):
             self._start_q = None
             self._start_ee_xyz = None
         self._rebuild_clients()
+        fixed_on_path = [j for j in fixed if j in group]
         return True, (f"link={frame} joints={len(joints)} "
+                      f"fixed={len(fixed_on_path)} "
                       f"mode={mode} jtc={jtc or '-'} fpc={fpc or '-'}")
 
     def _discover_controllers(self, joints) -> dict:
@@ -1236,11 +1361,20 @@ class PoseCommander(Node):
             ctrl_joints = list(self._jtc_joints) or list(self._joints)
             controlled = set(self._joints)
             cur = {j: self._joint_pos.get(j) for j in ctrl_joints}
+            fixed_hold = dict(self._fixed_hold)
             last = self._last_jtc_cmd
             rate = self._control_rate
-        data = [float(q_cmd[j]) if (j in controlled and j in q_cmd)
-                else float(cur[j] if cur[j] is not None else q_cmd.get(j, 0.0))
-                for j in ctrl_joints]
+        data = []
+        for j in ctrl_joints:
+            if j in controlled and j in q_cmd:
+                data.append(float(q_cmd[j]))
+            elif j in fixed_hold:
+                # Frozen joint: hold at the constant captured angle (not the
+                # live measured value, which would creep tick to tick).
+                data.append(float(fixed_hold[j]))
+            else:
+                data.append(
+                    float(cur[j] if cur[j] is not None else q_cmd.get(j, 0.0)))
         # Deadband (control-loop only): don't re-send a goal for an unchanged
         # solved config (would restart the same trajectory every tick). In
         # event-driven mode every target is intentional, so always send.
@@ -1290,6 +1424,7 @@ class PoseCommander(Node):
             ctrl_joints = list(self._fpc_joints) or list(self._joints)
             controlled = set(self._joints)
             cur = {j: self._joint_pos.get(j) for j in ctrl_joints}
+            fixed_hold = dict(self._fixed_hold)
             gain = self._reach_gain
             last = self._last_fpc_cmd
             rate = self._control_rate
@@ -1304,6 +1439,11 @@ class PoseCommander(Node):
         for j in ctrl_joints:
             if j in controlled and j in q_cmd:
                 goal[j] = float(q_cmd[j])
+            elif j in fixed_hold:
+                # Frozen joint: command the CONSTANT captured angle. Using the
+                # live measured value would feed encoder noise into the
+                # synchronized generator and make the joint slowly creep.
+                goal[j] = float(fixed_hold[j])
             else:
                 goal[j] = float(cur[j] if cur[j] is not None
                                 else q_cmd.get(j, 0.0))
@@ -1323,7 +1463,8 @@ class PoseCommander(Node):
             # this smoothed setpoint. Seed from the current joints on the first
             # tick after enable.
             if traj is None or list(traj.joints) != list(ctrl_joints):
-                seed_q = {j: (cur[j] if cur[j] is not None else goal[j])
+                seed_q = {j: (fixed_hold[j] if j in fixed_hold
+                              else (cur[j] if cur[j] is not None else goal[j]))
                           for j in ctrl_joints}
                 traj = SyncedJointTrajectory(ctrl_joints, seed_q,
                                              settle_rad=_FPC_SETTLE_RAD)
@@ -1405,6 +1546,12 @@ class PoseCommander(Node):
             self._enabled = True
             self._start_q = {j: float(seed[model.q_index(j)]) for j in joints}
             self._start_ee_xyz = np.asarray(start_xyz, dtype=float)
+            # Refresh each fixed joint's freeze point to where it physically is
+            # right now, so motion begins holding the current pose (no snap if a
+            # held joint was moved while disabled).
+            self._fixed_hold = {
+                j: float(self._joint_pos[j])
+                for j in self._fixed_joints if j in self._joint_pos}
             self._last_ee_disp = 0.0
             self._last_clamp_scale = 1.0
             self._last_fpc_cmd = None
@@ -1617,6 +1764,8 @@ class PoseCommander(Node):
             delta = self._last_delta
             reason = self._last_reason
             frame, joints = self._frame, list(self._joints)
+            fixed_joints = list(self._fixed_joints)
+            group_joints = list(self._group_joints)
             jtc, fpc, mode = self._jtc, self._fpc, self._mode
             cmd_joints = list(self._fpc_joints if mode == "fpc"
                               else self._jtc_joints)
@@ -1637,6 +1786,8 @@ class PoseCommander(Node):
             "controlled_frame": frame,
             "base_frame": self._base_frame or "(model root)",
             "joints": joints,
+            "fixed_joints": fixed_joints,
+            "group_joints": group_joints,
             "command_joints": cmd_joints,
             "jtc_controller": jtc,
             "fpc_controller": fpc,
