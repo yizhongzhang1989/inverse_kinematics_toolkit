@@ -35,11 +35,13 @@ shaper.
 
 * **Starts DISABLED.** No motion until you call `~/enable`. (`start_enabled` can
   override, but defaults to `false`.)
-* **Reachability gate:** solutions with `reachable == false` (joint-limit,
-  singular, task-conflict, max-iters) are rejected by default. Set
-  `allow_unreachable=true` to instead command the solver's **best-effort closest
-  config** (the arm *stretches toward* an out-of-reach target) — still bounded
-  by every gate below.
+* **Reachability gate:** when a solution is `reachable == false` (joint-limit,
+  singular, task-conflict, max-iters) the commander commands the solver's
+  **best-effort closest config** — the arm *stretches toward* an out-of-reach (or
+  still-being-edited) target instead of refusing to move — still bounded by every
+  gate below. This is the **default** (`allow_unreachable=true`). Set
+  `allow_unreachable=false` (or untick it in the dashboard) to instead **reject**
+  unreachable solutions and hold position until the target becomes reachable again.
 * **30 cm Cartesian envelope (`safety_radius_m`, default 0.30):** on `~/enable`
   the controlled frame's pose is captured as the **start**; thereafter every
   command is checked: in `jtc` a target whose predicted EE leaves the sphere is
@@ -139,18 +141,28 @@ ros2 service call /ikt_pose_commander_right/disable std_srvs/srv/Trigger
 | `jtc` | one speed-limited `FollowJointTrajectory` goal per target | discrete moves; conservative bring-up |
 
 `fpc` is the default. A **fixed-rate control loop** (`control_rate_hz`, default
-**200 Hz**) re-solves the latest target every tick and feeds the
-`forward_position_controller` through a built-in **acceleration-limited
-trajectory generator**: each joint is driven toward the IK goal with its velocity
-capped at `max_joint_speed` and ramped within `max_joint_accel`, so the streamed
-setpoint is a smooth trapezoidal-velocity profile with no jerk — the FPC itself
-does no interpolation. A stopping-distance brake parks the joint on the goal
-without overshoot, and the generator seeds IK from its **own commanded stream**
-(not the noisy measured joints), giving a rock-steady hold. The net effect: a
-sparse external pose stream (e.g. a ~25 Hz dashboard drag) is up-sampled into
-smooth 200 Hz motion. Set `control_rate_hz:=0` for the legacy event-driven path
-(one setpoint per received target, no interpolation). Switch to `jtc` for
-discrete, speed-limited `FollowJointTrajectory` goals.
+**200 Hz**) tracks the latest target and feeds the `forward_position_controller`
+through a built-in **time-synchronized, acceleration-limited trajectory
+generator**: all controlled joints advance along the *same* joint-space direction
+governed by **one** scalar trapezoidal speed sized for the lead (largest-travel)
+joint. They therefore stay **phase-locked** — the end-effector travels *directly*
+toward the target (a straight joint-space segment, not a curve) and **every joint
+reaches the goal at the same instant**, instead of small-travel joints finishing
+early while larger ones lag (the cause of the old "curve, then shake around the
+target" behaviour). The scalar speed is capped at `max_joint_speed`, ramped within
+`max_joint_accel`, and braked on a discrete-time stopping curve so the arm parks
+on the goal without overshoot or chatter; a large move (e.g. approaching a
+singularity) simply slows down. The IK goal is **solved once per target and
+cached** — re-used until the target pose moves more than ~1 mm / ~2 mrad — so the
+redundant (e.g. 7-DOF) solution no longer drifts in the null space between ticks
+(which previously made the arm jitter while holding). The generator seeds IK from
+its **own commanded stream** (not the noisy measured joints), giving a rock-steady
+hold, and an unchanged *unreachable* target is likewise not re-solved every tick
+(so a hopeless target can't starve the `/joint_states` callback). The FPC itself
+does no interpolation, so a sparse external pose stream (e.g. a ~25 Hz dashboard
+drag) is up-sampled into smooth 200 Hz motion. Set `control_rate_hz:=0` for the
+legacy event-driven path (one setpoint per received target, no interpolation).
+Switch to `jtc` for discrete, speed-limited `FollowJointTrajectory` goals.
 
 **Naming the controller.** Both controllers are **auto-derived** from
 `/controller_manager` by matching the controlled link's joints to a controller's
@@ -301,7 +313,7 @@ Keys split by how they apply:
 | key | kind | meaning |
 |---|---|---|
 | `safety_radius_m` | live | radius (m) of the Cartesian motion envelope around the start pose (default 0.30). |
-| `allow_unreachable` | live | `true` = best-effort: command the closest config and *stretch toward* unreachable targets (default `false`). |
+| `allow_unreachable` | live | `true` (**default**) = best-effort: command the closest config and *stretch toward* unreachable / still-being-edited targets. `false` = reject unreachable solutions and hold position until the target is reachable again. |
 | `stiffness_preset` | live | `full_pose` \| `position_only` \| `position_yaw` \| `custom`. How hard each DOF reaches; `custom` uses `default_stiffness`. |
 | `reach_gain` | live | (0,1] FPC approach scaling, **event-driven path only** (`control_rate_hz=0`): command `cur + reach_gain·(q_cmd−cur)` per target for a gradual stretch (default 1.0). Ignored by the accel-limited control loop. |
 | `control_rate_hz` | live | fixed-rate FPC control loop (default **200** Hz): re-solves the latest target and streams an accel-limited setpoint each tick. `0` = legacy event-driven (one setpoint per target, no interpolation). Capped at 250 Hz. |
@@ -354,6 +366,16 @@ See [config/commander_defaults.yaml](config/commander_defaults.yaml). Most-used:
   generator streams smooth motion (peak accel held at the `max_joint_accel` cap,
   rock-steady hold) on both robots' controller types
   (`ForwardCommandController` and `JointGroupPositionController`).
+* Validated on a **real dual-arm RealMan RM75** (7-DOF per arm) controlling one
+  arm at a time. The FPC generator was upgraded to a **time-synchronized**
+  (phase-locked) profile so all joints reach the goal together and the
+  end-effector moves directly toward the target — fixing a curved/shaking
+  approach seen with the earlier per-joint independent profiles. Verified on the
+  ROS mock + live arm: straight joint-space path, zero arrival spread, zero
+  settling chatter, IK goal cached per target (no null-space drift). Best-effort
+  reach (`allow_unreachable`) defaults **on** here so the arm keeps tracking an
+  out-of-reach or being-edited target. Unit tests:
+  [`test/test_trajectory.py`](test/test_trajectory.py).
 * **Dashboard** (independent HTTP/ROS client, port 8180) — Configure / Target
   frame gizmo / Snap-Track engage / live Parameters, validated on both robots.
 * Not yet: dual-arm **relative-pose** commanding (one object held by two arms —

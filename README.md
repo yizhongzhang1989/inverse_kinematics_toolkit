@@ -148,7 +148,9 @@ for all joints.
    → open http://localhost:8180, **Configure** the link to control (joints +
    controllers auto-derive), then **Snap robot** (one JTC move) or **Track robot**
    (drag the 3D gizmo — live FPC). FPC streaming is smoothed by a fixed-rate
-   (200 Hz) acceleration-limited loop. Starts **disabled**; every move is gated
+   (200 Hz) **time-synchronized**, acceleration-limited loop (all joints reach
+   the goal together → the end-effector moves straight at the target, no
+   curving/shaking). Starts **disabled**; every move is gated
    by a Cartesian envelope + jump/speed limits.
 5. **Optional — arm-angle (7-DOF S-R-S) redundancy.** Only this feature needs
    per-robot frame names. Set `srs_chain_names` + `srs_chains.<name>.{shoulder,
@@ -176,5 +178,7 @@ by link-name prefix — both are just UI defaults you can override in the dropdo
 controller commands. Actuation happens solely through `ikt_pose_commander`,
 which starts disabled and enforces a **Cartesian motion envelope** (a radius
 around the pose captured at enable), per-step jump, joint-speed and staleness
-gates before any motion; its FPC output is **acceleration-limited at a fixed rate**
-(default 200 Hz) for smooth, jerk-free streaming.
+gates before any motion; its FPC output is a **time-synchronized,
+acceleration-limited** fixed-rate (default 200 Hz) stream — all joints stay
+phase-locked and reach the goal together for smooth, jerk-free, straight-line
+motion.

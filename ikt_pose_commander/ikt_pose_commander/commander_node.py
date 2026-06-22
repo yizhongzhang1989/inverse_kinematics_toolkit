@@ -79,6 +79,10 @@ except Exception as _exc:  # noqa: BLE001  pragma: no cover
     frame_displacement = None  # type: ignore
     _IK_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
+# Time-synchronized joint-space streamer (the "move directly toward the target"
+# trajectory generator). Kept in its own module so it is unit-testable without ROS.
+from ikt_pose_commander.trajectory import SyncedJointTrajectory
+
 
 def _latched_qos() -> QoSProfile:
     return QoSProfile(
@@ -160,9 +164,13 @@ class PoseCommander(Node):
         # keeps today's behaviour (use default_stiffness verbatim).
         self.declare_parameter("stiffness_preset", "custom")
         # best-effort reach (Req 5): when a target is unreachable, command the
-        # solver's closest config (still gated) instead of rejecting. OFF by
-        # default so existing behaviour is unchanged.
-        self.declare_parameter("allow_unreachable", False)
+        # solver's closest config (still gated) so the arm STRETCHES TOWARD the
+        # target instead of refusing to move. Default ON for this workspace --
+        # operators expect the arm to keep tracking an out-of-reach / edited
+        # target (bounded by the Cartesian envelope + speed/accel limits). Set
+        # ``allow_unreachable:=false`` (or untick it in the dashboard) to restore
+        # the conservative reject-on-unreachable behaviour.
+        self.declare_parameter("allow_unreachable", True)
         # FPC approach scaling in (0, 1]: command cur + reach_gain*(q_cmd-cur)
         # for gradual, smoother stretching. 1.0 = full step (today's behaviour).
         self.declare_parameter("reach_gain", 1.0)
@@ -279,12 +287,35 @@ class PoseCommander(Node):
         # goal by at most max_joint_speed/rate per joint -> a smooth interpolated
         # ramp instead of a raw jump to the solved config. None = re-seed from
         # the current measured joints on the next tick (reset on enable/disable).
-        self._fpc_stream: Optional[Dict[str, float]] = None
-        # Per-joint commanded velocity for the accel-limited FPC generator
-        # (rad/s), integrated alongside _fpc_stream. Reset on enable/disable.
-        self._fpc_vel: Optional[Dict[str, float]] = None
+        #
+        # The stream is produced by a TIME-SYNCHRONIZED generator: all joints
+        # share one scalar trapezoidal speed and the SAME progress fraction, so
+        # they move along a straight joint-space line and arrive together (the
+        # end-effector travels directly toward the target instead of curving /
+        # shaking). See trajectory.SyncedJointTrajectory.
+        self._traj: Optional[SyncedJointTrajectory] = None
         # control loop (Phase 3): latest resolved target + its timer
         self._last_target = None              # (xyz, quat) in the solver frame
+        # Goal cache (control-loop / FPC): the solved+gated controlled-joint goal
+        # is reused until the target pose moves beyond a small threshold, so the
+        # redundant 7-DOF IK is NOT re-solved every tick. Re-solving each tick let
+        # the solution drift in the null space, which made the arm shake around
+        # the target. Reset on enable/disable.
+        self._cached_goal: Optional[Dict[str, float]] = None
+        self._cached_target_xyz: Optional[np.ndarray] = None
+        self._cached_target_quat: Optional[np.ndarray] = None
+        # Rejection cache: when a target is refused (unreachable / out of the
+        # Cartesian envelope), remember its pose so an UNCHANGED repeated target
+        # (e.g. a dashboard heartbeat re-sending the last gizmo pose, or the
+        # control loop re-processing the same _last_target at the loop rate) is
+        # not re-solved every tick. Without this the full IK runs at the control
+        # rate on a hopeless target, burning CPU and starving the joint_states
+        # callback (-> spurious "stale" holds). Invalidated when the target moves
+        # or on enable/disable. Holding while rejected does not move the arm, so
+        # the seed is unchanged and the verdict would be identical anyway.
+        self._rejected_target_xyz: Optional[np.ndarray] = None
+        self._rejected_target_quat: Optional[np.ndarray] = None
+        self._rejected_msg: str = ""
         self._control_timer = None
         self._control_timer_hz = 0.0
         # a pending config request (from launch params, ~/configure, or a staged
@@ -889,7 +920,38 @@ class PoseCommander(Node):
 
         Shared by the event-driven path (``_on_target``) and the control-loop
         timer (``_control_tick``). Re-seeds from the current joints each call.
+
+        Goal caching (FPC control loop only): the solved + gated controlled-joint
+        goal is cached and REUSED while the target pose is essentially unchanged,
+        so the redundant 7-DOF IK is solved once per target rather than every
+        tick. Re-solving each tick let the solution drift in the null space,
+        which made the end-effector shake around the target; caching gives one
+        stable goal the synchronized streamer drives to in a straight line.
         """
+        with self._lock:
+            rate = self._control_rate
+            mode = self._mode
+            cached_goal = self._cached_goal
+            c_xyz = self._cached_target_xyz
+            c_quat = self._cached_target_quat
+            best_effort_cached = self._last_best_effort
+            rej_xyz = self._rejected_target_xyz
+            rej_quat = self._rejected_target_quat
+        # Cache hit: same target, FPC control loop, already solved+gated -> just
+        # keep streaming toward the cached goal (no re-solve, no null-space drift).
+        if (rate > 0.0 and mode == "fpc" and cached_goal is not None
+                and not self._target_moved(xyz, quat, c_xyz, c_quat)):
+            self._command_fpc(cached_goal, best_effort_cached)
+            return
+
+        # Rejection cache hit: the same target was just refused. Re-processing it
+        # every control tick would re-run the full (failed) IK solve, burn CPU
+        # and starve the joint_states callback. Skip the solve while it is
+        # unchanged; the arm is held by the controller meanwhile.
+        if (rate > 0.0 and rej_xyz is not None
+                and not self._target_moved(xyz, quat, rej_xyz, rej_quat)):
+            return
+
         seed = self._build_seed(model)
         sol = self._solve(model, seed, xyz, quat)
         with self._lock:
@@ -902,6 +964,8 @@ class PoseCommander(Node):
             if not allow:
                 with self._lock:
                     self._last_best_effort = False
+                    self._cached_goal = None
+                self._remember_rejection(xyz, quat)
                 self._set_msg(
                     "target REJECTED: unreachable (%s)" % sol.reason.value)
                 return
@@ -911,6 +975,9 @@ class PoseCommander(Node):
             best_effort = True
         with self._lock:
             self._last_best_effort = best_effort
+            # A solvable target: clear any stale rejection cache.
+            self._rejected_target_xyz = None
+            self._rejected_target_quat = None
 
         # Commanded full configuration (active joints solved; the rest frozen at
         # the seed). The Cartesian safety gate and jump protection both act on
@@ -923,6 +990,9 @@ class PoseCommander(Node):
         # frame lands on the boundary. Independent of reachability.
         ok, q_full, gate_msg = self._apply_cartesian_gate(model, seed, q_full)
         if not ok:
+            with self._lock:
+                self._cached_goal = None
+            self._remember_rejection(xyz, quat)
             self._set_msg(gate_msg)
             return
 
@@ -952,7 +1022,38 @@ class PoseCommander(Node):
         if mode == "jtc":
             self._command_jtc(q_cmd, max_delta, best_effort)
         else:
+            # Cache the solved + gated goal so subsequent ticks for this same
+            # target reuse it (no re-solve, no null-space wander).
+            with self._lock:
+                self._cached_goal = dict(q_cmd)
+                self._cached_target_xyz = np.asarray(xyz, dtype=float)
+                self._cached_target_quat = (None if quat is None
+                                            else np.asarray(quat, dtype=float))
             self._command_fpc(q_cmd, best_effort)
+
+    def _target_moved(self, xyz, quat, c_xyz, c_quat,
+                      pos_tol: float = 1e-3, ang_tol: float = 2e-3) -> bool:
+        """True if the target pose moved beyond pos_tol (m) / ang_tol (rad) from
+        the cached one (or there is no cache) -> the IK goal must be re-solved."""
+        if c_xyz is None:
+            return True
+        if float(np.linalg.norm(np.asarray(xyz) - c_xyz)) > pos_tol:
+            return True
+        if (quat is None) != (c_quat is None):
+            return True
+        if quat is not None:
+            dot = abs(float(np.dot(np.asarray(quat), c_quat)))
+            if 2.0 * math.acos(min(1.0, dot)) > ang_tol:
+                return True
+        return False
+
+    def _remember_rejection(self, xyz, quat) -> None:
+        """Record a refused target so an unchanged repeat is not re-solved every
+        control tick (CPU / joint_states-starvation guard)."""
+        with self._lock:
+            self._rejected_target_xyz = np.asarray(xyz, dtype=float)
+            self._rejected_target_quat = (None if quat is None
+                                          else np.asarray(quat, dtype=float))
 
     def _apply_cartesian_gate(self, model, seed, q_full):
         """Enforce the 30 cm Cartesian envelope on the controlled frame.
@@ -1005,9 +1106,9 @@ class PoseCommander(Node):
             # commanded stream so the IK goal is deterministic (it does not track
             # measured-joint noise) -> steady hold + a consistent solve. Falls
             # back to measured joints (event-driven, JTC, or first tick).
-            stream = (dict(self._fpc_stream)
+            stream = (dict(self._traj.stream)
                       if (self._mode == "fpc" and self._control_rate > 0.0
-                          and self._fpc_stream) else None)
+                          and self._traj is not None) else None)
         for jn in model.joint_names:
             if jn in jp:
                 q[model.q_index(jn)] = jp[jn]
@@ -1175,8 +1276,7 @@ class PoseCommander(Node):
             rate = self._control_rate
             max_speed = self._max_speed
             max_accel = self._max_accel
-            stream = dict(self._fpc_stream) if self._fpc_stream else None
-            vel = dict(self._fpc_vel) if self._fpc_vel else None
+            traj = self._traj
         # Goal = the controller's FULL joint set: solved values for the
         # controlled sub-group, current position (hold) for the rest. The
         # ForwardCommandController drops a command whose width != its joint
@@ -1190,41 +1290,28 @@ class PoseCommander(Node):
                                 else q_cmd.get(j, 0.0))
 
         if rate > 0.0:
-            # Acceleration-limited joint-space trajectory generation: drive a
-            # per-joint velocity toward the IK goal, capped at max_joint_speed
-            # AND ramped within max_joint_accel, then integrate to the streamed
-            # position. This produces a smooth trapezoidal-velocity profile (no
-            # jerk at start/stop or on a moving target) the FPC servo tracks
-            # cleanly -- the FPC has no interpolation of its own. The stopping-
-            # distance cap sqrt(2*a*d) brakes in time so the joint settles on the
-            # goal without overshoot/chatter. Seed position from the current
-            # joints and velocity from rest on the first tick after enable.
-            if stream is None:
-                stream = {j: (cur[j] if cur[j] is not None else goal[j])
+            # TIME-SYNCHRONIZED trajectory generation: all joints advance along
+            # the SAME joint-space direction governed by ONE scalar trapezoidal
+            # speed sized for the lead (largest-travel) joint. They therefore
+            # stay phase-locked and reach the goal together -> the end-effector
+            # moves directly toward the target (straight joint-space segment)
+            # instead of curving while early-finishing joints wait, and it parks
+            # without the residual shaking the old per-joint profiles produced.
+            # The lead speed is acceleration-limited and braked by sqrt(2*a*d) so
+            # the arm settles on the goal without overshoot. The move naturally
+            # slows when the IK goal demands large joint travel (e.g. nearing a
+            # singularity). The FPC has no interpolation of its own, so we stream
+            # this smoothed setpoint. Seed from the current joints on the first
+            # tick after enable.
+            if traj is None or list(traj.joints) != list(ctrl_joints):
+                seed_q = {j: (cur[j] if cur[j] is not None else goal[j])
                           for j in ctrl_joints}
-            if vel is None:
-                vel = {j: 0.0 for j in ctrl_joints}
+                traj = SyncedJointTrajectory(ctrl_joints, seed_q,
+                                             settle_rad=_FPC_SETTLE_RAD)
             dt = 1.0 / rate
-            dv_max = max_accel * dt
-            data = []
-            for j in ctrl_joints:
-                dist = goal[j] - stream[j]
-                if abs(dist) < _FPC_SETTLE_RAD:
-                    v_des = 0.0
-                else:
-                    v_brake = math.sqrt(2.0 * max_accel * abs(dist))
-                    v_des = math.copysign(min(max_speed, v_brake), dist)
-                dv = v_des - vel[j]
-                if dv > dv_max:
-                    dv = dv_max
-                elif dv < -dv_max:
-                    dv = -dv_max
-                vel[j] = vel[j] + dv
-                stream[j] = stream[j] + vel[j] * dt
-                data.append(stream[j])
+            data = traj.step(goal, dt, max_speed, max_accel)
             with self._lock:
-                self._fpc_stream = stream
-                self._fpc_vel = vel
+                self._traj = traj
                 self._last_fpc_cmd = data
         else:
             # Event-driven (rate=0): publish the solved setpoint directly, with
@@ -1303,8 +1390,12 @@ class PoseCommander(Node):
             self._last_clamp_scale = 1.0
             self._last_fpc_cmd = None
             self._last_jtc_cmd = None
-            self._fpc_stream = None
-            self._fpc_vel = None
+            self._traj = None
+            self._cached_goal = None
+            self._cached_target_xyz = None
+            self._cached_target_quat = None
+            self._rejected_target_xyz = None
+            self._rejected_target_quat = None
             self._last_target = None
             self._last_best_effort = False
         self._set_msg(
@@ -1318,8 +1409,12 @@ class PoseCommander(Node):
         with self._lock:
             self._enabled = False
             self._last_target = None
-            self._fpc_stream = None
-            self._fpc_vel = None
+            self._traj = None
+            self._cached_goal = None
+            self._cached_target_xyz = None
+            self._cached_target_quat = None
+            self._rejected_target_xyz = None
+            self._rejected_target_quat = None
             mode, jtc, fpc = self._mode, self._jtc, self._fpc
         # Return to JTC, which holds the current pose.
         if self._do_switch and mode == "fpc" and jtc and fpc:
