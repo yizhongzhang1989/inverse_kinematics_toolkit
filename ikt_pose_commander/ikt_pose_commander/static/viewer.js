@@ -330,6 +330,7 @@ gizmo.attach(targetProxy);
 scene.add(gizmo);
 
 let tracking = false;        // FPC live-align active (Track robot)
+let readMode = true;         // dashboard mode: true = Read/monitor, false = Send/control
 let controlledFrame = "";    // commander's current controlled_frame
 let rootFrame = "";          // model root frame name (target frame_id)
 let _proxyInit = false;      // target frame placed at least once
@@ -341,7 +342,7 @@ gizmo.addEventListener("dragging-changed", (e) => {
   if (!e.value && tracking) sendProxyTarget(true);   // final pose on release while tracking
 });
 gizmo.addEventListener("objectChange", () => {
-  if (!tracking) return;                        // dragging commands the robot only while tracking
+  if (readMode || !tracking) return;            // commands only in Send mode while tracking
   const now = performance.now();
   if (now - _lastStreamT >= STREAM_MIN_MS) { _lastStreamT = now; sendProxyTarget(true); }
 });
@@ -462,8 +463,43 @@ if ($("btn-disable")) $("btn-disable").onclick = stopRobot;
 // "match" the target). Skipped while live-tracking so an active FPC stream isn't
 // yanked to a new pose mid-motion.
 if ($("link-select")) $("link-select").addEventListener("change", () => {
-  if (!tracking && window.__lastLinkTf) snapTargetToLink();
+  if (!readMode && !tracking && window.__lastLinkTf) snapTargetToLink();
 });
+
+// ---- dashboard Read / Send mode ----------------------------------------
+// Read = the dashboard only DISPLAYS the live commanded target (e.g. coming from
+//        the SpaceMouse); the gizmo + engage controls are hidden, nothing is
+//        published. Send = drag the gizmo to command the robot.
+function updateModeUI() {
+  const rb = $("btn-mode-read"), sb = $("btn-mode-send");
+  if (rb) rb.classList.toggle("sel", readMode);
+  if (sb) sb.classList.toggle("sel", !readMode);
+  gizmo.enabled = !readMode;
+  gizmo.visible = !readMode;
+  targetProxy.visible = !readMode;     // hide the draggable frame in Read mode; the marker shows the live target
+  const tf = $("tf-ctl-row"); if (tf) tf.style.display = readMode ? "none" : "";
+  const eng = $("engage-ctl-row"); if (eng) eng.style.display = readMode ? "none" : "";
+  const hint = $("grab-hint"); if (hint) hint.style.display = readMode ? "none" : "";
+}
+async function setDashMode(read) {
+  readMode = !!read;
+  if (readMode) {
+    if (tracking) await stopRobot();   // stop commanding when switching to monitor
+    actionMsg("Read mode — the frame follows the live target (e.g. SpaceMouse). Nothing is sent.");
+  } else {
+    // entering Send: seed the gizmo at the current live target so the first drag
+    // does not jump the robot.
+    if (targetGroup.visible) {
+      targetGroup.matrix.decompose(targetProxy.position, targetProxy.quaternion, targetProxy.scale);
+      targetProxy.scale.set(1, 1, 1); targetProxy.updateMatrixWorld(true); _proxyInit = true;
+    }
+    actionMsg("Send mode — drag the frame, then Snap robot or Track robot.");
+  }
+  updateModeUI();
+}
+if ($("btn-mode-read")) $("btn-mode-read").onclick = () => setDashMode(true);
+if ($("btn-mode-send")) $("btn-mode-send").onclick = () => setDashMode(false);
+updateModeUI();
 
 // ---- live target --------------------------------------------------------
 function updateTarget(t) {
