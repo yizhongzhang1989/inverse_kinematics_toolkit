@@ -69,14 +69,11 @@ try:
     from ikt_core.robot_model import RobotModel
     from ikt_core import ik_core
     from ikt_core.tasks import Task
-    from ikt_core.safety import clamp_config_to_sphere, frame_displacement
     _IK_IMPORT_ERROR: Optional[str] = None
 except Exception as _exc:  # noqa: BLE001  pragma: no cover
     RobotModel = None  # type: ignore
     ik_core = None  # type: ignore
     Task = None  # type: ignore
-    clamp_config_to_sphere = None  # type: ignore
-    frame_displacement = None  # type: ignore
     _IK_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 # Time-synchronized joint-space streamer (the "move directly toward the target"
@@ -103,7 +100,7 @@ _LIVE_KEYS = (
     "max_step_rad",
     "joint_states_stale_after", "joint_centering_weight", "damping",
     "tol_pos", "tol_ori", "max_iters", "default_stiffness",
-    "safety_radius_m", "allow_unreachable", "stiffness_preset", "reach_gain",
+    "allow_unreachable", "reach_gain",
     "control_rate_hz",
 )
 _STRUCTURAL_KEYS = (
@@ -111,8 +108,6 @@ _STRUCTURAL_KEYS = (
     "fpc_controller", "command_mode",
 )
 
-# Valid stiffness presets (Req 5: "how hard each DOF reaches the target").
-_STIFFNESS_PRESETS = ("full_pose", "position_only", "position_yaw", "custom")
 # FPC republish deadband: skip streaming a setpoint that is essentially the
 # previous one (anti-chatter, esp. best-effort holding at a joint limit).
 _FPC_DEADBAND_RAD = 1e-4
@@ -164,18 +159,16 @@ class PoseCommander(Node):
         self.declare_parameter("start_enabled", False)         # SAFETY: off
         self.declare_parameter("switch_controllers", True)
         self.declare_parameter("controller_manager", "/controller_manager")
-        # solver
+        # solver. ``default_stiffness`` = per-DOF Cartesian stiffness
+        # [x y z rx ry rz]: 0 lets that DOF float free, a positive value
+        # constrains it (1 = fully rigid). e.g. [1 1 1 0 0 0] = position only.
         self.declare_parameter("default_stiffness",
                                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-        # stiffness preset (Req 5): full_pose | position_only | position_yaw |
-        # custom (custom uses the 6-vector default_stiffness above). "custom"
-        # keeps today's behaviour (use default_stiffness verbatim).
-        self.declare_parameter("stiffness_preset", "custom")
         # best-effort reach (Req 5): when a target is unreachable, command the
         # solver's closest config (still gated) so the arm STRETCHES TOWARD the
         # target instead of refusing to move. Default ON for this workspace --
         # operators expect the arm to keep tracking an out-of-reach / edited
-        # target (bounded by the Cartesian envelope + speed/accel limits). Set
+        # target (bounded by the speed/accel limits). Set
         # ``allow_unreachable:=false`` (or untick it in the dashboard) to restore
         # the conservative reject-on-unreachable behaviour.
         self.declare_parameter("allow_unreachable", True)
@@ -197,10 +190,6 @@ class PoseCommander(Node):
         self.declare_parameter("min_move_time", 0.5)           # s
         self.declare_parameter("max_step_rad", 0.8)            # jump reject
         self.declare_parameter("joint_states_stale_after", 0.5)  # s
-        # SAFETY: the controlled frame may not leave a sphere of this radius
-        # (metres) around the pose captured at ~/enable. Enforced in _on_target
-        # by the Cartesian gate; backed by tools/ikt_safety_watchdog.py.
-        self.declare_parameter("safety_radius_m", 0.30)
         # control loop (Req 2): >0 Hz re-solves the latest target and streams a
         # velocity-limited, INTERPOLATED joint setpoint to the FPC on a fixed
         # timer -> smooth motion (no raw jump to the IK solution). Default
@@ -237,7 +226,6 @@ class PoseCommander(Node):
         self._do_switch = bool(gp("switch_controllers").value)
         self._cm = str(gp("controller_manager").value or "/controller_manager")
         self._stiffness = [float(v) for v in gp("default_stiffness").value]
-        self._stiffness_preset = self._norm_preset(gp("stiffness_preset").value)
         self._allow_unreachable = bool(gp("allow_unreachable").value)
         self._reach_gain = min(1.0, max(1e-3, float(gp("reach_gain").value)))
         self._centering = float(gp("joint_centering_weight").value)
@@ -250,7 +238,6 @@ class PoseCommander(Node):
         self._min_time = max(0.0, float(gp("min_move_time").value))
         self._max_step = float(gp("max_step_rad").value)
         self._js_stale = float(gp("joint_states_stale_after").value)
-        self._safety_radius = max(0.0, float(gp("safety_radius_m").value))
         self._control_rate = max(0.0, min(_CONTROL_RATE_MAX_HZ,
                                           float(gp("control_rate_hz").value)))
         status_rate = max(0.5, float(gp("status_rate_hz").value))
@@ -287,13 +274,8 @@ class PoseCommander(Node):
         self._last_reason = ""
         self._last_delta = 0.0
         self._goal_handle = None
-        # SAFETY (Phase 0): the motion envelope. On ~/enable we capture the
-        # measured joints + the controlled-frame position (FK) as the centre of
-        # the allowed sphere; the Cartesian gate keeps every command inside it.
+        # On ~/enable we capture the measured joints as the return-to-start pose.
         self._start_q: Optional[Dict[str, float]] = None
-        self._start_ee_xyz: Optional[np.ndarray] = None
-        self._last_ee_disp = 0.0
-        self._last_clamp_scale = 1.0
         self._last_fpc_cmd: Optional[List[float]] = None
         self._last_best_effort = False
         self._last_jtc_cmd: Optional[List[float]] = None
@@ -325,8 +307,8 @@ class PoseCommander(Node):
         self._cached_goal: Optional[Dict[str, float]] = None
         self._cached_target_xyz: Optional[np.ndarray] = None
         self._cached_target_quat: Optional[np.ndarray] = None
-        # Rejection cache: when a target is refused (unreachable / out of the
-        # Cartesian envelope), remember its pose so an UNCHANGED repeated target
+        # Rejection cache: when a target is refused (unreachable), remember its
+        # pose so an UNCHANGED repeated target
         # (e.g. a dashboard heartbeat re-sending the last gizmo pose, or the
         # control loop re-processing the same _last_target at the loop rate) is
         # not re-solved every tick. Without this the full IK runs at the control
@@ -529,7 +511,7 @@ class PoseCommander(Node):
         inside this callback). Structural changes are rejected while enabled to
         keep the parameter store consistent with the active config — EXCEPT a
         ``fixed_joints``-only change, which is applied live (it keeps the
-        controllers + safety envelope), mirroring the ``~/configure`` topic.
+        controllers), mirroring the ``~/configure`` topic.
         """
         live: dict = {}
         structural: dict = {}
@@ -594,7 +576,6 @@ class PoseCommander(Node):
                 ("damping", "_damping", None),
                 ("tol_pos", "_tol_pos", None),
                 ("tol_ori", "_tol_ori", None),
-                ("safety_radius_m", "_safety_radius", 0.0),
             ):
                 if req.get(key) is None:
                     continue
@@ -620,10 +601,6 @@ class PoseCommander(Node):
                         changed.append("default_stiffness")
                 except (TypeError, ValueError):
                     pass
-            if req.get("stiffness_preset") is not None:
-                preset = self._norm_preset(req["stiffness_preset"])
-                self._stiffness_preset = preset
-                changed.append("stiffness_preset=%s" % preset)
             if req.get("allow_unreachable") is not None:
                 self._allow_unreachable = self._as_bool(req["allow_unreachable"])
                 changed.append("allow_unreachable=%s" % self._allow_unreachable)
@@ -645,15 +622,21 @@ class PoseCommander(Node):
             if "base_frame" in req and req["base_frame"] is not None:
                 self._base_frame = str(req["base_frame"] or "")
                 changed.append("base_frame=%s" % (self._base_frame or "(root)"))
+            # Any live change must re-drive the robot. Invalidate the goal +
+            # rejection caches so the background control loop (control_rate_hz>0)
+            # RE-SOLVES the stored target on its next tick with the new settings,
+            # instead of re-streaming the previously cached goal. Without this a
+            # parameter edit (e.g. default_stiffness) only takes effect once the
+            # TARGET POSE moves -- the loop keeps serving the stale cached goal.
+            if changed:
+                self._cached_goal = None
+                self._cached_target_xyz = None
+                self._cached_target_quat = None
+                self._rejected_target_xyz = None
+                self._rejected_target_quat = None
         if rate_changed:
             self._reconcile_control_timer()
         return ", ".join(changed)
-
-    @staticmethod
-    def _norm_preset(value) -> str:
-        """Normalise a stiffness-preset value; unknowns fall back to 'custom'."""
-        s = str(value if value is not None else "custom").strip().lower()
-        return s if s in _STIFFNESS_PRESETS else "custom"
 
     @staticmethod
     def _as_bool(value) -> bool:
@@ -715,7 +698,7 @@ class PoseCommander(Node):
         picks the JTC/FPC controllers. ``joints`` and controller names are
         auto-derived when omitted. A general reconfig is **refused while enabled**
         (disable first), but a change to **only** ``fixed_joints`` is applied
-        **live** (see below) since it keeps the controllers + safety envelope.
+        **live** (see below) since it keeps the controllers.
         """
         with self._lock:
             enabled = self._enabled
@@ -729,12 +712,12 @@ class PoseCommander(Node):
             return False, "no model yet"
 
         # Fast path: a change to ONLY ``fixed_joints`` (no frame/group/controller/
-        # mode change) keeps the controlled frame, the controllers, and the
-        # Cartesian safety envelope identical — it just freezes/releases joints
-        # within the SAME group. So it is applied **live, even while enabled**: we
-        # re-derive the active set and drop the motion caches so the next target
-        # re-solves around the newly fixed joints, without dropping engagement.
-        # (Any other structural change still requires disabling first.)
+        # mode change) keeps the controlled frame and the controllers identical —
+        # it just freezes/releases joints within the SAME group. So it is applied
+        # **live, even while enabled**: we re-derive the active set and drop the
+        # motion caches so the next target re-solves around the newly fixed
+        # joints, without dropping engagement. (Any other structural change still
+        # requires disabling first.)
         fixed_only = ("fixed_joints" in req and not any(
             k in req for k in ("controlled_frame", "joints", "jtc_controller",
                                "fpc_controller", "command_mode")))
@@ -778,10 +761,9 @@ class PoseCommander(Node):
                 if not self._enabled:
                     # disabled: re-capture the start pose on the next ~/enable.
                     self._start_q = None
-                    self._start_ee_xyz = None
             fixed_on_path = [j for j in fixed if j in group]
             return True, (
-                "fixed=%d joints=%d (live%s; controllers + envelope unchanged)"
+                "fixed=%d joints=%d (live%s; controllers unchanged)"
                 % (len(fixed_on_path), len(joints),
                    ", enabled" if enabled else ""))
 
@@ -885,11 +867,10 @@ class PoseCommander(Node):
             self._jtc, self._fpc, self._mode = jtc, fpc, mode
             self._jtc_joints, self._fpc_joints = jtc_joints, fpc_joints
             self._configured = True
-            # The captured start pose / motion envelope belonged to the previous
-            # group; invalidate it so it is re-captured on the next ~/enable (and
-            # a return-to-start before re-enabling is refused, not crashing).
+            # The captured start pose belonged to the previous group; invalidate
+            # it so it is re-captured on the next ~/enable (and a return-to-start
+            # before re-enabling is refused, not crashing).
             self._start_q = None
-            self._start_ee_xyz = None
         self._rebuild_clients()
         fixed_on_path = [j for j in fixed if j in group]
         return True, (f"link={frame} joints={len(joints)} "
@@ -1113,22 +1094,9 @@ class PoseCommander(Node):
             self._rejected_target_quat = None
 
         # Commanded full configuration (active joints solved; the rest frozen at
-        # the seed). The Cartesian safety gate and jump protection both act on
-        # this BEFORE anything is sent to a controller.
+        # the seed). Jump protection acts on this BEFORE anything is sent to a
+        # controller.
         q_full = np.asarray(sol.q, dtype=float)
-
-        # --- Cartesian safety gate (Phase 0) -----------------------------
-        # Keep the controlled frame inside the sphere captured at ~/enable.
-        # BOTH modes clamp the joint step so the frame lands on the sphere
-        # boundary (the arm stretches to the closest point toward an
-        # out-of-envelope / unreachable target). Independent of reachability.
-        ok, q_full, gate_msg = self._apply_cartesian_gate(model, seed, q_full)
-        if not ok:
-            with self._lock:
-                self._cached_goal = None
-            self._remember_rejection(xyz, quat)
-            self._set_msg(gate_msg)
-            return
 
         # jump protection: max joint change over the CONTROLLED joints vs current
         q_cmd = {j: float(q_full[model.q_index(j)]) for j in self._joints}
@@ -1145,15 +1113,14 @@ class PoseCommander(Node):
         # Jump protection guards the EVENT-DRIVEN path (control_rate_hz=0), where
         # a target is commanded in one shot with no velocity limiting. Under the
         # control loop (rate>0) BOTH modes are inherently speed-limited, so a
-        # large step (e.g. a best-effort / envelope-clamped stretch toward an
-        # unreachable target, which near a singularity needs a big joint move for
-        # a small Cartesian one) executes as a slow, smooth, bounded trajectory
-        # rather than a dangerous instant jump:
+        # large step (e.g. a best-effort stretch toward an unreachable target,
+        # which near a singularity needs a big joint move for a small Cartesian
+        # one) executes as a slow, smooth, bounded trajectory rather than a
+        # dangerous instant jump:
         #   * FPC ramps to the goal via the synchronized accel-limited generator;
         #   * JTC sends ONE FollowJointTrajectory whose duration scales with the
         #     joint delta (max(min_move_time, max_delta/max_joint_speed)).
-        # The Cartesian envelope already bounds the EE to safety_radius_m either
-        # way. So the hard reject applies only when the control loop is off.
+        # So the hard reject applies only when the control loop is off.
         speed_limited = rate > 0.0
         if max_delta > self._max_step and not speed_limited:
             self._set_msg(
@@ -1199,49 +1166,6 @@ class PoseCommander(Node):
             self._rejected_target_quat = (None if quat is None
                                           else np.asarray(quat, dtype=float))
 
-    def _apply_cartesian_gate(self, model, seed, q_full):
-        """Enforce the 30 cm Cartesian envelope on the controlled frame.
-
-        Returns ``(ok, q_out, reject_msg)``. With no start pose captured or a
-        non-positive radius it is a no-op. Within the sphere it passes the
-        configuration through. Outside, BOTH modes clamp the joint step so the
-        controlled frame lands on the sphere boundary (move to the closest point
-        within the envelope) and return the scaled configuration. Updates
-        ``_last_ee_disp`` / ``_last_clamp_scale`` for status either way.
-        """
-        with self._lock:
-            start = self._start_ee_xyz
-            radius = self._safety_radius
-            frame = self._frame
-            mode = self._mode
-        if start is None or radius <= 0.0 or frame_displacement is None:
-            return True, q_full, ""
-        with self._fk_lock:
-            d = frame_displacement(model, q_full, frame, start)
-        if d <= radius:
-            with self._lock:
-                self._last_ee_disp = d
-                self._last_clamp_scale = 1.0
-            return True, q_full, ""
-        # Outside the envelope: CLAMP the joint step so the controlled frame
-        # lands on the sphere boundary -> the arm moves to the CLOSEST point
-        # within the envelope. Applied in BOTH modes so JTC behaves like FPC:
-        # an unreachable / out-of-envelope (or being-edited) target makes the
-        # arm stretch toward it, up to the 0.30 m bound, instead of refusing to
-        # move. The clamped config is a valid joint goal -- FPC streams to it;
-        # JTC sends it as one speed-limited trajectory -- and the hard 0.30 m
-        # bound is preserved either way.
-        with self._fk_lock:
-            q_out, scale, d_cl = clamp_config_to_sphere(
-                model, seed, q_full, frame, start, radius)
-        with self._lock:
-            self._last_ee_disp = d_cl
-            self._last_clamp_scale = scale
-        self.get_logger().warn(
-            "[commander] EE clamp (%s): %.3f -> %.3f m (scale %.2f, radius %.2f)"
-            % (mode, d, d_cl, scale, radius))
-        return True, q_out, ""
-
     def _build_seed(self, model: "RobotModel") -> np.ndarray:
         q = model.neutral()
         with self._lock:
@@ -1273,26 +1197,18 @@ class PoseCommander(Node):
                                  active_joints=self._joints)
 
     def _build_task(self, xyz, quat):
-        """Build the IK Task per the active stiffness preset (Req 5).
+        """Build the IK Task from the per-DOF ``default_stiffness`` 6-vector.
 
-        ``full_pose`` -> all 6 DOF; ``position_only`` -> orientation free;
-        ``position_yaw`` -> position + yaw (pitch/roll free); ``custom`` -> the
-        6-vector ``default_stiffness``. This is the easy knob for *how hard each
-        DOF reaches the target* (e.g. position_only reaches the point even when
-        orientation can't be matched).
+        ``default_stiffness`` = [x y z rx ry rz] sets each Cartesian DOF's
+        stiffness directly: ``0`` lets that DOF float free, a positive value
+        constrains it (``1`` = fully rigid). e.g. ``[1 1 1 0 0 0]`` reaches the
+        target position with orientation free; ``[1 1 1 0 0 1]`` adds yaw only.
         """
         with self._lock:
             frame = self._frame
-            preset = self._stiffness_preset
             stiff = tuple(self._stiffness)
         xyz_t = tuple(float(v) for v in xyz)
         quat_t = tuple(float(v) for v in quat)
-        if preset == "full_pose":
-            return Task.pose(frame, xyz_t, quat_t)
-        if preset == "position_only":
-            return Task.point(frame, xyz_t)
-        if preset == "position_yaw":
-            return Task.position_yaw(frame, xyz_t, quat_t)
         return Task(frame, xyz_t, quat_t, stiff)
 
     def _resolve_pose(self, msg: PoseStamped):
@@ -1513,7 +1429,7 @@ class PoseCommander(Node):
             model = self._model
             configured = self._configured
             mode, jtc, fpc = self._mode, self._jtc, self._fpc
-            frame, joints = self._frame, list(self._joints)
+            joints = list(self._joints)
         if not configured:
             return False, ("unconfigured; name the link to control via "
                            "~/configure or the dashboard first")
@@ -1533,27 +1449,17 @@ class PoseCommander(Node):
             deact = [other] if other else []
             if not self._switch(activate=[want], deactivate=deact):
                 return False, self._last_msg or "controller switch failed"
-        # SAFETY (Phase 0): capture the start pose = centre of the 30 cm motion
-        # envelope. Record the measured joints (for return-to-start) and the
-        # controlled frame's position via FK.
+        # Capture the start pose (measured joints) for return-to-start.
         seed = self._build_seed(model)
-        try:
-            with self._fk_lock:
-                start_xyz, _ = model.fk(seed, frame)
-        except Exception as exc:  # noqa: BLE001
-            return False, "cannot enable: FK of start pose failed (%r)" % exc
         with self._lock:
             self._enabled = True
             self._start_q = {j: float(seed[model.q_index(j)]) for j in joints}
-            self._start_ee_xyz = np.asarray(start_xyz, dtype=float)
             # Refresh each fixed joint's freeze point to where it physically is
             # right now, so motion begins holding the current pose (no snap if a
             # held joint was moved while disabled).
             self._fixed_hold = {
                 j: float(self._joint_pos[j])
                 for j in self._fixed_joints if j in self._joint_pos}
-            self._last_ee_disp = 0.0
-            self._last_clamp_scale = 1.0
             self._last_fpc_cmd = None
             self._last_jtc_cmd = None
             self._traj = None
@@ -1565,10 +1471,7 @@ class PoseCommander(Node):
             self._last_target = None
             self._last_best_effort = False
         self._set_msg(
-            "ENABLED (mode=%s, controller=%s); start EE [%.3f %.3f %.3f] m, "
-            "safety_radius=%.2f m" % (mode, want, float(start_xyz[0]),
-                                      float(start_xyz[1]), float(start_xyz[2]),
-                                      self._safety_radius))
+            "ENABLED (mode=%s, controller=%s)" % (mode, want))
         return True, "enabled"
 
     def _srv_disable(self, request, response):
@@ -1769,14 +1672,8 @@ class PoseCommander(Node):
             jtc, fpc, mode = self._jtc, self._fpc, self._mode
             cmd_joints = list(self._fpc_joints if mode == "fpc"
                               else self._jtc_joints)
-            safety_radius = self._safety_radius
             control_rate = self._control_rate
-            start_ee = (self._start_ee_xyz.tolist()
-                        if self._start_ee_xyz is not None else None)
-            ee_disp = self._last_ee_disp
-            clamp_scale = self._last_clamp_scale
             allow_unreachable = self._allow_unreachable
-            stiffness_preset = self._stiffness_preset
             reach_gain = self._reach_gain
             best_effort = self._last_best_effort
         status = {
@@ -1807,13 +1704,8 @@ class PoseCommander(Node):
             "tol_pos": self._tol_pos,
             "tol_ori": self._tol_ori,
             "max_iters": self._max_iters,
-            "safety_radius_m": safety_radius,
             "control_rate_hz": control_rate,
-            "start_ee": start_ee,
-            "ee_displacement": ee_disp,
-            "clamp_scale": clamp_scale,
             "allow_unreachable": allow_unreachable,
-            "stiffness_preset": stiffness_preset,
             "reach_gain": reach_gain,
             "best_effort": best_effort,
             "commands_robot": True,

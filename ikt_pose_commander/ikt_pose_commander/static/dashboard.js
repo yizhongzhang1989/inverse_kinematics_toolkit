@@ -182,6 +182,47 @@ async function onParamChange(el) {
   setMsg(out.ok ? ("set " + key) : ("set " + key + " failed: " + (out.message || "")));
 }
 
+// ---- per-DOF stiffness sliders -> one default_stiffness 6-vector ----------
+// Six range sliders (X Y Z RX RY RZ) are assembled into the default_stiffness
+// vector and sent together. 0 = that DOF floats free, 1 = fully constrained.
+function setStiffSlider(i, val) {
+  const el = $("p-stiff-" + i);
+  const out = $("v-stiff-" + i);
+  if (el) el.value = val;
+  if (out) out.textContent = Number(val).toFixed(2);
+}
+function readStiffness() {
+  const arr = [];
+  for (let i = 0; i < 6; i++) {
+    const el = $("p-stiff-" + i);
+    const v = el ? parseFloat(el.value) : NaN;
+    if (Number.isNaN(v)) return null;
+    arr.push(v);
+  }
+  return arr;
+}
+async function sendStiffness() {
+  const arr = readStiffness();
+  if (!arr) return;
+  const out = await postJSON("/api/configure", { default_stiffness: arr });
+  setMsg(out.ok ? "set default_stiffness"
+                : ("set default_stiffness failed: " + (out.message || "")));
+}
+// While dragging a slider: update its readout live and STREAM the vector
+// throttled (~20 Hz) so the change drives the robot smoothly without flooding
+// /api/configure; a final apply fires on release (the change event).
+let _stiffTimer = null, _stiffLast = 0;
+function onStiffInput(el) {
+  const out = $(el.dataset.out);
+  if (out) out.textContent = parseFloat(el.value).toFixed(2);
+  const now = performance.now();
+  if (now - _stiffLast >= 50) { _stiffLast = now; sendStiffness(); }
+  else {
+    clearTimeout(_stiffTimer);
+    _stiffTimer = setTimeout(() => { _stiffLast = performance.now(); sendStiffness(); }, 50);
+  }
+}
+
 // Populate the parameter inputs ONCE from the live status, then leave them to
 // the user (the 400 ms refresh must never wipe what is being typed).
 let _paramsInit = false;
@@ -196,6 +237,12 @@ function initParams(s) {
     else el.value = v;
     any = true;
   });
+  // per-DOF stiffness sliders (assembled into one vector, not data-key driven)
+  const st = s.default_stiffness;
+  if (Array.isArray(st) && st.length === 6) {
+    for (let i = 0; i < 6; i++) setStiffSlider(i, st[i]);
+    any = true;
+  }
   if (any) _paramsInit = true;
 }
 
@@ -207,6 +254,13 @@ $("btn-configure").onclick = doConfigure;
 // IK / motion parameter inputs: apply each one live on change.
 document.querySelectorAll("[data-key]").forEach((el) => {
   el.addEventListener("change", () => onParamChange(el));
+});
+
+// Per-DOF stiffness sliders: live readout + throttled streaming while dragging,
+// plus a final apply on release.
+document.querySelectorAll(".stiff-dof").forEach((el) => {
+  el.addEventListener("input", () => onStiffInput(el));
+  el.addEventListener("change", sendStiffness);
 });
 
 // kick off polling: connection pill + link/base dropdowns every 400 ms (the 3D

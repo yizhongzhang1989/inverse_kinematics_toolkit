@@ -108,17 +108,15 @@
     <section class="card">
       <h2>Parameters <span class="muted">(applied live)</span></h2>
       <div class="psub">IK solver</div>
-      <label>stiffness preset
-        <select id="p-stiff-preset" data-key="stiffness_preset">
-          <option value="custom">custom (6-vector)</option>
-          <option value="full_pose">full_pose</option>
-          <option value="position_only">position_only</option>
-          <option value="position_yaw">position_yaw</option>
-        </select>
-      </label>
-      <label>custom stiffness [x y z rx ry rz]
-        <input id="p-stiff6" type="text" data-key="default_stiffness" data-vec="1" placeholder="1 1 1 1 1 1" />
-      </label>
+      <div class="stiff-head">DOF stiffness <span class="muted">(0 = free · 1 = rigid)</span></div>
+      <div class="stiff-grid">
+        <div class="stiff-row"><span class="stiff-lbl">X</span><input type="range" class="stiff-dof" id="p-stiff-0" data-out="v-stiff-0" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-0">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">Y</span><input type="range" class="stiff-dof" id="p-stiff-1" data-out="v-stiff-1" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-1">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">Z</span><input type="range" class="stiff-dof" id="p-stiff-2" data-out="v-stiff-2" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-2">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">RX</span><input type="range" class="stiff-dof" id="p-stiff-3" data-out="v-stiff-3" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-3">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">RY</span><input type="range" class="stiff-dof" id="p-stiff-4" data-out="v-stiff-4" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-4">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">RZ</span><input type="range" class="stiff-dof" id="p-stiff-5" data-out="v-stiff-5" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-5">1.00</span></div>
+      </div>
       <label><input type="checkbox" id="p-allow-unreach" data-key="allow_unreachable"> allow_unreachable (best-effort stretch)</label>
       <div class="row3">
         <label>reach gain <input id="p-reach-gain" type="number" data-key="reach_gain" step="0.05" min="0.001" max="1" /></label>
@@ -138,7 +136,6 @@
       </div>
       <div class="row3">
         <label>stale after (s) <input id="p-js-stale" type="number" data-key="joint_states_stale_after" step="0.1" min="0" /></label>
-        <label>safety radius (m) <input id="p-safety-radius" type="number" data-key="safety_radius_m" step="0.05" min="0" /></label>
         <label>control rate (Hz) <input id="p-control-rate" type="number" data-key="control_rate_hz" step="5" min="0" max="250" /></label>
       </div>
     </section>

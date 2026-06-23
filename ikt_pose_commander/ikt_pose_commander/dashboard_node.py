@@ -456,8 +456,8 @@ class CommanderDashboard(Node):
 
         Any subset of commander config keys is accepted (the commander
         validates and applies them live or structurally). ``controlled_frame``
-        is only needed for the initial group setup; live tunables (stiffness
-        preset, allow_unreachable, speed/step limits, safety_radius_m,
+        is only needed for the initial group setup; live tunables
+        (default_stiffness, allow_unreachable, speed/step limits,
         control_rate_hz, ...) can be sent on their own -> full
         dashboard parity with the topic/param/service path.
         """
