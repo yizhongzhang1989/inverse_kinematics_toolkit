@@ -36,6 +36,7 @@ from launch_ros.substitutions import FindPackageShare
 # auto-derived from the URDF + /controller_manager.
 _FALLBACKS = {
     "command_mode": "fpc",
+    "controlled_frame": "",
     "jtc_controller": "",
     "fpc_controller": "",
     "start_enabled": "false",
@@ -49,6 +50,7 @@ _FALLBACKS = {
     "joint_states_stale_after": 0.5,
     "control_rate_hz": 200.0,
     "status_rate_hz": 10.0,
+    "dashboard_port": "",
     "dashboard_base_frame": "base_link",
 }
 
@@ -73,9 +75,11 @@ def generate_launch_description():
         # Override (e.g. ``left``/``right``) for multi-arm setups, which
         # suffixes the node + dashboard namespace as ``ikt_pose_commander_<name>``.
         DeclareLaunchArgument("instance_name", default_value=""),
-        # Robot-specific: empty => start UNCONFIGURED, pick the link at runtime
+        # Robot-specific: from config (ikt_pose_commander: controlled_frame) or
+        # this arg. Empty => start UNCONFIGURED, pick the link at runtime
         # (dashboard / ~/configure); joints + controllers are auto-derived.
-        DeclareLaunchArgument("controlled_frame", default_value=""),
+        DeclareLaunchArgument("controlled_frame",
+                              default_value=str(d["controlled_frame"])),
         # Controller names: "" = auto-derive from /controller_manager by matching
         # the controlled link's joints. Pin the exact name via the central
         # config (ikt_pose_commander: section) or these arguments.
@@ -112,9 +116,11 @@ def generate_launch_description():
                               default_value=str(d["control_rate_hz"])),
         DeclareLaunchArgument("status_rate_hz",
                               default_value=str(d["status_rate_hz"])),
+        # From config (ikt_pose_commander: dashboard_port) or this arg.
         # Empty => headless (no dashboard). Any port => also launch the dashboard
         # wired to this commander instance.
-        DeclareLaunchArgument("dashboard_port", default_value=""),
+        DeclareLaunchArgument("dashboard_port",
+                              default_value=str(d["dashboard_port"])),
         DeclareLaunchArgument("dashboard_base_frame",
                               default_value=str(d["dashboard_base_frame"])),
     ]
