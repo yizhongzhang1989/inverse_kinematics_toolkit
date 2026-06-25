@@ -23,6 +23,16 @@ trapezoidal speed sized for the lead (largest-travel) joint, so:
 * a moving goal is tracked smoothly (the direction is recomputed each tick and
   the scalar speed carries momentum, so re-aiming is jerk-bounded).
 
+Near a **singularity** the synchronized profile has a downside: it slaves every
+joint to one shared speed, so a barely-advancing or big-reconfiguration IK goal
+makes the *whole* arm crawl. For that case :meth:`SyncedJointTrajectory.step_independent`
+runs a **decoupled per-joint** profile instead -- each joint slews toward its
+goal at its own (per-joint) speed/accel cap. That gives up the straight
+end-effector path through the singular region in exchange for not crawling and
+for bounding the big proximal joints. The commander switches between the two
+(gated on the solver's ``sigma_min``); both maintain ``self.vel`` so the handoff
+is velocity-continuous.
+
 It is pure Python (no ROS, no third-party deps) and deterministic, so it is unit
 + scenario tested in isolation.
 """
@@ -55,12 +65,17 @@ class SyncedJointTrajectory:
         self.joints: List[str] = list(joints)
         self.stream: Dict[str, float] = {j: float(q0[j]) for j in self.joints}
         self.lead_vel: float = 0.0          # scalar speed of the lead coord (rad/s)
+        # Realized per-joint velocity (rad/s). Maintained by BOTH step() and
+        # step_independent() so the two profiles hand off without a velocity
+        # discontinuity when the commander switches modes near a singularity.
+        self.vel: Dict[str, float] = {j: 0.0 for j in self.joints}
         self.settle_rad: float = float(settle_rad)
 
     def reset(self, q0: Dict[str, float]) -> None:
         """Re-seed the stream position and zero the velocity (on enable)."""
         self.stream = {j: float(q0[j]) for j in self.joints}
         self.lead_vel = 0.0
+        self.vel = {j: 0.0 for j in self.joints}
 
     def set_position(self, q: Dict[str, float]) -> None:
         """Force the stream position without touching the velocity."""
@@ -96,6 +111,8 @@ class SyncedJointTrajectory:
         if lead <= 1e-12:
             # Exactly there: hold and rest.
             self.lead_vel = 0.0
+            for j in self.joints:
+                self.vel[j] = 0.0
             return [self.stream[j] for j in self.joints]
 
         dv_max = max_accel * dt
@@ -140,6 +157,81 @@ class SyncedJointTrajectory:
         frac = self.lead_vel * dt / lead
         if frac > 1.0:
             frac = 1.0
+        inv_dt = 1.0 / dt
         for j in self.joints:
-            self.stream[j] += delta[j] * frac
+            step_j = delta[j] * frac
+            self.stream[j] += step_j
+            # Record the realized per-joint velocity so a later switch to
+            # step_independent() resumes from the current speed (no jerk).
+            self.vel[j] = step_j * inv_dt
         return [self.stream[j] for j in self.joints]
+
+    def step_independent(self, goal: Dict[str, float], dt: float,
+                         max_speed: Dict[str, float],
+                         max_accel: Dict[str, float]) -> List[float]:
+        """Advance one tick with a DECOUPLED per-joint profile (NOT synchronized).
+
+        Unlike :meth:`step`, every joint runs its OWN acceleration-limited
+        trapezoidal profile toward its goal, bounded by its OWN ``max_speed[j]``
+        / ``max_accel[j]`` cap. Joints with little travel finish quickly while
+        large / proximal joints are held to their (typically lower) limit, so
+        the arm does **not** crawl at the pace of one shared profile. The
+        joint-space path is therefore not a straight line and the end-effector
+        does not track a straight Cartesian path -- the intended trade-off for
+        moving through a singular region: bound every joint's speed (especially
+        the big ones) and give up exact end-effector tracking.
+
+        ``max_speed`` / ``max_accel`` are mappings ``joint -> limit`` (rad/s,
+        rad/s^2). Velocity-continuous with :meth:`step` via ``self.vel``.
+        """
+        out: List[float] = []
+        for j in self.joints:
+            delta = goal[j] - self.stream[j]
+            d = abs(delta)
+            if d <= 1e-12:
+                self.vel[j] = 0.0
+                out.append(self.stream[j])
+                continue
+            a = max(1e-9, float(max_accel[j]))
+            vmax = max(0.0, float(max_speed[j]))
+            dv = a * dt
+            half_adt = 0.5 * dv
+            # Discrete-time stopping curve (identical to step()'s lead brake):
+            # the largest speed from which this joint still halts within ``d``.
+            v_brake = -half_adt + math.sqrt(half_adt * half_adt + 2.0 * a * d)
+            if d <= self.settle_rad:
+                v_des = 0.0                       # park cleanly inside the band
+            else:
+                v_des = min(vmax, v_brake, d / dt)
+            # Acceleration-limit this joint's SPEED magnitude toward v_des, then
+            # hard-cap onto the brake curve -- exactly as step() does for the
+            # lead coordinate, so each joint inherits the same accel-safe,
+            # overshoot-free trapezoid (just with its own per-joint limits).
+            spd = abs(self.vel[j])
+            if v_des > spd + dv:
+                spd = spd + dv
+            elif v_des < spd - dv:
+                spd = spd - dv
+            else:
+                spd = v_des
+            if spd > v_brake:
+                spd = v_brake
+            if spd < 0.0:
+                spd = 0.0
+            frac = spd * dt / d
+            if frac > 1.0:
+                frac = 1.0
+            step_j = delta * frac
+            self.stream[j] += step_j
+            self.vel[j] = step_j / dt          # realized signed velocity
+            out.append(self.stream[j])
+        return out
+
+    def resync_lead(self) -> None:
+        """Seed the synchronized lead speed from the current per-joint speeds.
+
+        Call when switching from :meth:`step_independent` back to :meth:`step`
+        so the shared trapezoidal profile resumes from the fastest joint's
+        speed instead of a stale value (keeps the handoff jerk-bounded).
+        """
+        self.lead_vel = max((abs(v) for v in self.vel.values()), default=0.0)

@@ -39,6 +39,57 @@ to the neutral pose, normalises quaternions, and accepts `stiffness`,
 options. `IK.solve_many([...])` solves multiple tips at once. See
 [`examples/solve_from_file.py`](examples/solve_from_file.py).
 
+## Algorithm
+
+`ik_core.py` is a single **weighted, damped least-squares (Levenberg-Marquardt)
+Gauss-Newton** solver with hard joint limits. One formulation covers every
+feature — single tip, multi-tip / dual-arm, position-only, joint centering,
+7-DOF arm-angle and relative-pose tasks — by stacking their rows into the same
+least-squares problem:
+
+$$
+\begin{aligned}
+\min_{q}\quad & \tfrac{1}{2}\sum_{k}\left\lVert W_{t,k}^{1/2}\,e_k(q)\right\rVert^{2}
+\;+\; \tfrac{1}{2}\left\lVert W_q^{1/2}\,(q - q_{\mathrm{rest}})\right\rVert^{2} \\
+\text{s.t.}\quad & q_{\min} \le q \le q_{\max}
+\end{aligned}
+$$
+
+- $e_k(q)$ is the 6-DOF pose error (position + log-map orientation) of task $k$,
+  evaluated on the Pinocchio model in the `LOCAL_WORLD_ALIGNED` frame.
+- $W_{t,k}$ is the per-DOF **task stiffness** (a zero weight drops that DOF — e.g.
+  position-only); $W_q$ is the **joint-centering / rest-posture** weight.
+
+Each iteration:
+
+1. **Stack** every task's weighted error $W^{1/2}e$ and weighted Jacobian
+   $W^{1/2}J$ (plus any extra arm-angle / relative-pose rows the caller
+   injects). Columns for frozen (inactive) joints are zeroed so those joints
+   never move.
+2. **Damped step** via the normal equations
+   $(J^\top W J + \mu I)\,\Delta q_{\mathrm{task}} = J^\top W e$; the damping
+   $\mu$ keeps the step finite through singularities.
+3. **Posture bias** is projected into the task **null space** —
+   $\Delta q_{\mathrm{null}} = \left(I - (J^\top W J + \mu I)^{-1} J^\top W J\right) W_q\,(q_{\mathrm{rest}} - q)$
+   — so joint centering pulls the redundant DOF toward $q_{\mathrm{rest}}$
+   without degrading the Cartesian task.
+4. **Box-projected backtracking line search:** the combined
+   $\Delta q_{\mathrm{task}} + \Delta q_{\mathrm{null}}$ step is clipped to
+   $[q_{\min}, q_{\max}]$ and accepted only if it lowers the task error;
+   otherwise the step is halved, and if the combined step stalls the task-only
+   step is tried, so the posture bias can never block convergence.
+5. **Adaptive damping:** $\mu$ shrinks ($\times 0.7$) after a good step and grows
+   ($\times 2$, up to a cap) when no step helps — the singularity-robust LM
+   behaviour.
+
+**Termination & verdict.** The solve succeeds once the worst-case raw error is
+within tolerance (defaults `1e-3 m`, `3.5e-3 rad`), ignoring DOFs whose
+stiffness is zero. Otherwise it stops on no-further-progress, the damping cap,
+or `max_iters` (default 200) and reports *why*: `JOINT_LIMIT`, `SINGULAR`
+(smallest singular value below threshold) or `TASK_CONFLICT`, along with the
+**blocking joints**, manipulability and $\sigma_{\min}$. Seeding from the current
+joint state yields minimal-change, continuous solutions.
+
 ## Why a "package"? (layout)
 
 `ikt_core` is shipped as an `ament_python`/setuptools package — it has a

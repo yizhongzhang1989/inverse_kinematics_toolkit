@@ -146,8 +146,10 @@ reaches the goal at the same instant**, instead of small-travel joints finishing
 early while larger ones lag (the cause of the old "curve, then shake around the
 target" behaviour). The scalar speed is capped at `max_joint_speed`, ramped within
 `max_joint_accel`, and braked on a discrete-time stopping curve so the arm parks
-on the goal without overshoot or chatter; a large move (e.g. approaching a
-singularity) simply slows down. The IK goal is **solved once per target and
+on the goal without overshoot or chatter; a large move simply slows down (and
+*near a singularity* the generator can switch to a per-joint profile so the arm
+doesn't crawl — see **Passing through a singularity** below). The IK goal is
+**solved once per target and
 cached** — re-used until the target pose moves more than ~1 mm / ~2 mrad — so the
 redundant (e.g. 7-DOF) solution no longer drifts in the null space between ticks
 (which previously made the arm jitter while holding). The generator seeds IK from
@@ -157,6 +159,39 @@ hold, and an unchanged *unreachable* target is likewise not re-solved every tick
 does no interpolation, so a sparse external pose stream (e.g. a ~25 Hz dashboard
 drag) is up-sampled into smooth 200 Hz motion. Set `control_rate_hz:=0` for the
 legacy event-driven path (one setpoint per received target, no interpolation).
+
+### Passing through a singularity (per-joint decoupling)
+
+The synchronized profile has one downside **near a singularity**: because every
+joint is slaved to one shared speed, a heavily-damped IK goal that barely
+advances (or demands a big reconfiguration) makes the *whole* arm **crawl** —
+every joint creeping. When `singularity_decouple` is on (the default), the
+generator detects singularity proximity from the solver's `sigma_min` (the
+smallest Jacobian singular value) and, once it drops below `singularity_sigma`,
+switches to a **decoupled per-joint** profile: each joint slews toward its goal
+at its **own** acceleration-limited speed, so small-travel joints finish quickly
+and the large **proximal joints are held to their own (lower) cap**. The
+trade-off is explicit — the end-effector **no longer tracks a straight Cartesian
+path** through the singular region — which is exactly what you want for *moving
+through* a singularity instead of stalling at it. Hysteresis
+(`singularity_exit_ratio`, disengage above `singularity_sigma * ratio`) plus a
+velocity-continuous hand-off keep the switch jerk-bounded; away from
+singularities the motion is the normal synchronized straight line.
+
+Set **per-joint caps** with `joint_speed_limits` / `joint_accel_limits` — a JSON
+object string mapping joint name → limit (rad/s, rad/s²); any joint not listed
+falls back to the scalar `max_joint_speed` / `max_joint_accel`. Slow the big
+joints, e.g.:
+
+```bash
+ros2 param set /ikt_pose_commander joint_speed_limits \
+    '{"arm_1_joint_1": 0.3, "arm_1_joint_2": 0.3, "arm_1_joint_3": 0.4}'
+```
+
+Disable the behaviour entirely (always synchronized, today's straight-line
+motion everywhere) with `singularity_decouple:=false`. The dashboard's last-solve
+readout reports the live `sigma_min` and a `decoupled_active` flag so you can see
+when the arm is in the singular region.
 
 Switch to `jtc` for discrete, speed-limited `FollowJointTrajectory` goals. The
 **same per-target goal cache** applies here: under the control loop a held target
@@ -182,13 +217,59 @@ ros2 launch ikt_pose_commander commander.launch.py \
     fpc_controller:=forward_position_controller   # or jtc_controller:=arm_1_controller
 ```
 
+## Target modes: absolute vs delta + snapping
+
+How an incoming target updates the internal goal pose is selected by
+`target_mode` (a **live** key — settable at launch, via `~/configure`,
+`ros2 param set`, or the dashboard):
+
+| `target_mode` | input topic | meaning |
+|---|---|---|
+| `absolute` (default) | `~/target_pose` (`PoseStamped`) | the message **sets** the goal pose (TF-resolved into the solve frame) — the classic gizmo / `send_pose` path |
+| `delta` | `~/target_delta` (`PoseStamped`) | the message is a **small incremental transform** that is **composed onto** the goal — the SpaceMouse / jog path |
+
+In **delta** mode each `~/target_delta` message is read as a *delta*, not an
+absolute pose: its position is a translation increment and its orientation a
+rotation increment (identity = no change). The delta is applied in `delta_frame`
+(another live key):
+
+* `base` (default) — a **world-frame** increment: translate along the model-root
+  axes, the rotation is left-multiplied;
+* `tool` — a **body-frame** increment: translate along the controlled frame's own
+  axes, the rotation is right-multiplied.
+
+Set `delta_frame` to match the teleop's `jog_frame`. Because the commander owns
+the goal in delta mode, a teleop source (e.g. `spacemouse_teleop` with
+`output_mode:=delta`) only has to stream small deltas — it never needs the
+robot's TF or current pose. An absolute target on `~/target_pose` is **ignored**
+while in delta mode (and vice-versa), so there is no two-publisher tug-of-war.
+
+**Snapping the goal to the current pose.** `~/snap_target` (`std_srvs/Trigger`)
+sets the internal goal to the controlled frame's **current pose** (forward
+kinematics of the measured joints). Use it to:
+
+* seed the goal **before delta jogging** so increments accumulate from where the
+  arm actually is (the commander also auto-snaps on `~/enable` when in delta
+  mode, and on the first delta if the goal is unset) — no jump;
+* **re-centre** the target onto the live pose at any time.
+
+```bash
+# switch to delta jogging, then seed + jog
+ros2 param set /ikt_pose_commander target_mode delta
+ros2 service call /ikt_pose_commander/snap_target std_srvs/srv/Trigger
+# stream small base-frame deltas (+1 mm in x per message) on ~/target_delta
+ros2 topic pub /ikt_pose_commander/target_delta geometry_msgs/msg/PoseStamped \
+    '{header: {frame_id: base_link}, pose: {position: {x: 0.001}, orientation: {w: 1.0}}}'
+```
+
 ## Dashboard (optional, independent)
 
 A web dashboard (`dashboard_node`) monitors and drives the commander — **without**
 importing any commander/IK internals. It is a thin HTTP/ROS client of the
 commander's API (`~/status`, `~/configure`, `~/enable`, `~/disable`,
-`~/target_pose`) plus its own TF listener. The commander runs fine without it; it
-is launched automatically when `dashboard_port` is set, or standalone:
+`~/snap_target`, `~/target_pose`) plus its own TF listener. The commander runs
+fine without it; it is launched automatically when `dashboard_port` is set, or
+standalone:
 
 ```bash
 ros2 launch ikt_pose_commander dashboard.launch.py \
@@ -196,13 +277,17 @@ ros2 launch ikt_pose_commander dashboard.launch.py \
 # then open http://localhost:8180
 ```
 
-The page renders the live robot in 3D (from `/robot_description` meshes) as four
-left-panel cards. Every action goes through the commander's safety gates, so the
-UI can never bypass reachability / jump / speed limits:
+The page renders the live robot in 3D (from `/robot_description` meshes) as a set
+of left-panel cards. Every action goes through the commander's safety gates, so
+the UI can never bypass reachability / jump / speed limits:
 
 * **Configure** — pick the link to control and the base reference link from the
   live URDF, then **Configure** (joints + JTC/FPC controllers auto-derive). Do
-  this while the commander is disabled.
+  this while the commander is disabled. **Snap target → current pose** calls
+  `~/snap_target` to set the goal onto the controlled link's live pose.
+* **Target mode** — switch the commander between **Absolute** (the gizmo / send
+  path sets the goal) and **Delta (jog)** (incremental poses on `~/target_delta`,
+  e.g. the SpaceMouse, are added to the goal). Snap first to seed the goal.
 * **Target frame** — a draggable 3D gizmo (move / rotate handles) is the goal
   pose the controlled link is driven to match. **Snap target → link** resets the
   gizmo onto the current link pose.
@@ -212,8 +297,13 @@ UI can never bypass reachability / jump / speed limits:
   into smooth motion; **Stop / Disengage** disables and holds.
 * **Parameters** — live-edit the solver / motion tunables (per-DOF
   `default_stiffness`, `max_joint_speed`, `max_joint_accel`,
-  `control_rate_hz`, tolerances, …). Each field posts to `~/configure` on change
-  and applies immediately.
+  `control_rate_hz`, the singularity knobs `singularity_decouple` /
+  `singularity_sigma` / `joint_speed_limits`, tolerances, …). Each field posts to
+  `~/configure` on change and applies immediately.
+
+The 3D target marker follows a fresh absolute target on `~/target_pose` when
+present, otherwise the commander's internal goal pose (`~/status`) — so the
+snapped / delta-jogged goal is shown even when nothing publishes `~/target_pose`.
 
 Default port **8180** (8080/8100/8120/8140/8160 are used by the other toolkit
 dashboards). For a multi-arm robot run one dashboard per arm on distinct ports

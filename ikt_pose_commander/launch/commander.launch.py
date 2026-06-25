@@ -27,6 +27,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (LaunchConfiguration, PathJoinSubstitution,
                                    PythonExpression)
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 # Robot-NEUTRAL launch defaults, taken from the toolkit's centralized config
@@ -41,6 +42,11 @@ _FALLBACKS = {
     "fpc_controller": "",
     "start_enabled": "false",
     "base_frame": "",
+    # Target input: "absolute" = ~/target_pose sets the goal; "delta" =
+    # ~/target_delta increments it (the SpaceMouse delta path). delta_frame =
+    # "base" (model root) | "tool" (controlled-frame axes), match the teleop.
+    "target_mode": "absolute",
+    "delta_frame": "base",
     "switch_controllers": "true",
     "controller_manager": "/controller_manager",
     "max_joint_speed": 0.5,
@@ -50,6 +56,14 @@ _FALLBACKS = {
     "joint_states_stale_after": 0.5,
     "control_rate_hz": 200.0,
     "status_rate_hz": 10.0,
+    # Singularity handling (see commander_node.py / README). Near a singular
+    # config the synchronized FPC stream crawls; decouple to per-joint profiles
+    # there (gated on sigma_min) and cap the big joints via the per-joint maps.
+    "singularity_decouple": "true",
+    "singularity_sigma": 0.04,
+    "singularity_exit_ratio": 2.0,
+    "joint_speed_limits": "",
+    "joint_accel_limits": "",
     "dashboard_port": "",
     "dashboard_base_frame": "base_link",
 }
@@ -95,6 +109,11 @@ def generate_launch_description():
         # Robot-neutral, from central config:
         DeclareLaunchArgument("command_mode",
                               default_value=str(d["command_mode"])),
+        # absolute | delta (see _FALLBACKS). delta = jog by incremental poses.
+        DeclareLaunchArgument("target_mode",
+                              default_value=str(d["target_mode"])),
+        DeclareLaunchArgument("delta_frame",
+                              default_value=str(d["delta_frame"])),
         DeclareLaunchArgument("start_enabled",
                               default_value=str(d["start_enabled"])),
         DeclareLaunchArgument("base_frame", default_value=str(d["base_frame"])),
@@ -116,6 +135,18 @@ def generate_launch_description():
                               default_value=str(d["control_rate_hz"])),
         DeclareLaunchArgument("status_rate_hz",
                               default_value=str(d["status_rate_hz"])),
+        # Singularity handling (per-joint decouple near a singularity).
+        DeclareLaunchArgument("singularity_decouple",
+                              default_value=str(d["singularity_decouple"])),
+        DeclareLaunchArgument("singularity_sigma",
+                              default_value=str(d["singularity_sigma"])),
+        DeclareLaunchArgument("singularity_exit_ratio",
+                              default_value=str(d["singularity_exit_ratio"])),
+        # Per-joint speed/accel caps for the decoupled mode (JSON object string).
+        DeclareLaunchArgument("joint_speed_limits",
+                              default_value=str(d["joint_speed_limits"])),
+        DeclareLaunchArgument("joint_accel_limits",
+                              default_value=str(d["joint_accel_limits"])),
         # From config (ikt_pose_commander: dashboard_port) or this arg.
         # Empty => headless (no dashboard). Any port => also launch the dashboard
         # wired to this commander instance.
@@ -138,6 +169,8 @@ def generate_launch_description():
             "jtc_controller": LaunchConfiguration("jtc_controller"),
             "fpc_controller": LaunchConfiguration("fpc_controller"),
             "command_mode": LaunchConfiguration("command_mode"),
+            "target_mode": LaunchConfiguration("target_mode"),
+            "delta_frame": LaunchConfiguration("delta_frame"),
             "start_enabled": LaunchConfiguration("start_enabled"),
             "base_frame": LaunchConfiguration("base_frame"),
             "joints": LaunchConfiguration("joints"),
@@ -152,6 +185,17 @@ def generate_launch_description():
                 LaunchConfiguration("joint_states_stale_after"),
             "control_rate_hz": LaunchConfiguration("control_rate_hz"),
             "status_rate_hz": LaunchConfiguration("status_rate_hz"),
+            "singularity_decouple":
+                LaunchConfiguration("singularity_decouple"),
+            "singularity_sigma": LaunchConfiguration("singularity_sigma"),
+            "singularity_exit_ratio":
+                LaunchConfiguration("singularity_exit_ratio"),
+            # Force str so launch's YAML inference doesn't parse the JSON map
+            # into a dict (the node param is a string it json-decodes itself).
+            "joint_speed_limits": ParameterValue(
+                LaunchConfiguration("joint_speed_limits"), value_type=str),
+            "joint_accel_limits": ParameterValue(
+                LaunchConfiguration("joint_accel_limits"), value_type=str),
         }],
     )
 

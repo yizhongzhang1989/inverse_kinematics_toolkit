@@ -245,6 +245,8 @@ class CommanderDashboard(Node):
             Trigger, f"{self._ns}/disable", callback_group=self._cbg)
         self._cli_return = self.create_client(
             Trigger, f"{self._ns}/return_to_start", callback_group=self._cbg)
+        self._cli_snap = self.create_client(
+            Trigger, f"{self._ns}/snap_target", callback_group=self._cbg)
 
         if _HAVE_TF:
             self._tf_buffer = tf2_ros.Buffer()
@@ -390,6 +392,44 @@ class CommanderDashboard(Node):
                 "age": round(age, 2), "fresh": age <= self._stale,
                 "transformed_from": transformed_from}
 
+    def _target_from_status(self) -> Optional[dict]:
+        """The commander's internal goal pose (from ``~/status``), in the render
+        frame. Used as a fallback for the 3D marker when nothing is publishing on
+        ``~/target_pose`` (e.g. after a snap, or while jogging in delta mode the
+        commander owns the goal and there is no absolute target stream). The
+        internal target is already in the model root frame (== base_frame here)."""
+        with self._lock:
+            s = self._status
+            stamp = self._status_stamp
+        if not s:
+            return None
+        tp = s.get("target_pose")
+        if not isinstance(tp, dict):
+            return None
+        xyz, quat = tp.get("xyz"), tp.get("quat")
+        if not (isinstance(xyz, list) and len(xyz) == 3
+                and isinstance(quat, list) and len(quat) == 4):
+            return None
+        age = time.monotonic() - stamp if stamp else None
+        return {"xyz": [float(v) for v in xyz],
+                "quat": [float(v) for v in quat],
+                "frame_id": self._base_frame,
+                "age": round(age, 2) if age is not None else None,
+                "fresh": age is not None and age <= self._stale,
+                "transformed_from": None, "source": "status"}
+
+    def _best_target(self) -> Optional[dict]:
+        """Live commanded target for the 3D marker: prefer a FRESH absolute
+        target on ``~/target_pose`` (gizmo / spacemouse-absolute), else fall back
+        to the commander's internal goal pose from ``~/status`` (snap / delta)."""
+        topic_t = self._target_in_base()
+        if topic_t is not None and topic_t.get("fresh"):
+            return topic_t
+        status_t = self._target_from_status()
+        if status_t is not None:
+            return status_t
+        return topic_t
+
     def snapshot(self) -> dict:
         with self._lock:
             s = self._status
@@ -402,7 +442,7 @@ class CommanderDashboard(Node):
         out = {"status": s, "fresh": fresh,
                "age": round(age, 2) if age is not None else None,
                "commander_ns": self._ns, "base_frame": self._base_frame,
-               "target": self._target_in_base(), "has_model_viz": model is not None}
+               "target": self._best_target(), "has_model_viz": model is not None}
         if model is not None:
             q = self._full_q(model)
             with self._fk_lock:
@@ -493,6 +533,25 @@ class CommanderDashboard(Node):
         fut.add_done_callback(lambda _f: done.set())
         if not done.wait(timeout=timeout):
             return {"ok": False, "message": "return_to_start timed out"}
+        res = fut.result()
+        return {"ok": bool(res.success), "message": res.message}
+
+    def call_snap_target(self, timeout: float = 5.0) -> dict:
+        """Call the commander's ``~/snap_target`` service.
+
+        Snaps the commander's internal target onto the controlled frame's
+        CURRENT pose (forward kinematics of the measured joints) -- the
+        server-side counterpart of the 3D "Snap target -> link" button, used to
+        seed the goal before delta jogging or to re-centre with no jump.
+        """
+        if not self._cli_snap.wait_for_service(timeout_sec=timeout):
+            return {"ok": False, "message": "snap_target unavailable "
+                    "(is the commander running + configured?)"}
+        fut = self._cli_snap.call_async(Trigger.Request())
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "snap_target timed out"}
         res = fut.result()
         return {"ok": bool(res.success), "message": res.message}
 
@@ -629,6 +688,9 @@ class CommanderDashboard(Node):
                 if path == "/api/return_to_start":
                     return self._send(200, json.dumps(
                         dash.call_return_to_start()))
+                if path == "/api/snap_target":
+                    return self._send(200, json.dumps(
+                        dash.call_snap_target()))
                 if path == "/api/capture":
                     xyz, quat = dash.capture()
                     if xyz is None:

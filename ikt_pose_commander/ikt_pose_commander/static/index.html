@@ -76,7 +76,21 @@
         <div class="fj-head">fixed joints <span class="muted">(held out of IK — e.g. a lifter; tick to freeze)</span></div>
         <div id="fixed-joints-list" class="fj-list"><div class="muted sm">waiting for model…</div></div>
       </div>
-      <button id="btn-configure" class="btn btn-go">Configure</button>
+      <div class="row">
+        <button id="btn-configure" class="btn btn-go">Configure</button>
+        <button id="btn-snap-current" type="button" class="btn sm" title="Snap the commander's target onto the controlled link's current pose">Snap target → current pose</button>
+      </div>
+    </section>
+
+    <!-- Target mode: absolute (set the goal directly) vs delta (jog by
+         increments, e.g. from the SpaceMouse). -->
+    <section class="card">
+      <h2>Target mode <span class="muted">(how the goal is set)</span></h2>
+      <div class="row">
+        <button id="btn-tmode-absolute" type="button" class="btn sm sel">Absolute</button>
+        <button id="btn-tmode-delta" type="button" class="btn sm">Delta (jog)</button>
+      </div>
+      <div class="vf-hint" id="tmode-hint">Absolute: a target pose on <code>~/target_pose</code> (the 3D gizmo / send) sets the goal. Delta: incremental poses on <code>~/target_delta</code> (e.g. the SpaceMouse) are added to the goal; <b>Snap target → current pose</b> first to seed it.</div>
     </section>
 
     <!-- Dashboard mode: Read (monitor the live target) vs Send (control it) -->
