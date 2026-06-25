@@ -1,0 +1,86 @@
+:root {
+  --bg: #0f1419; --panel: rgba(22,28,38,.92); --ink: #e6edf3; --muted: #8b98a5;
+  --accent: #2f81f7; --ok: #2ea043; --bad: #d1242f; --warn: #d29922; --line: #30363d;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg); color: var(--ink); font-size: 13px;
+}
+/* The 3D area is a positioned container; the canvas fills it at 100%. A bare
+   <canvas> with fixed insets falls back to its intrinsic (drawing-buffer) size,
+   which detaches it from the layout — the container avoids that. */
+#stage { position: fixed; top: 0; right: 0; bottom: 0; left: 340px; }
+#viewer { display: block; width: 100%; height: 100%; }
+
+#loading {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 14px; color: var(--muted); font-size: 15px; z-index: 5;
+}
+.spinner {
+  width: 38px; height: 38px; border: 4px solid #30363d; border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#hud {
+  position: fixed; top: 12px; right: 16px; z-index: 10;
+  display: flex; gap: 10px; align-items: center;
+}
+
+#panel {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 340px; z-index: 10;
+  background: var(--panel); backdrop-filter: blur(6px);
+  border-right: 1px solid var(--line); padding: 14px 16px 40px;
+  overflow-y: auto;
+}
+#panel h1 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+.muted { color: var(--muted); font-weight: normal; font-size: 11px; }
+.sm { font-size: 11px; }
+
+.card { background: rgba(13,17,23,.5); border: 1px solid var(--line); border-radius: 9px; padding: 12px; margin-bottom: 12px; }
+.card h2 { font-size: 12px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+
+label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+label > input, label > select { display: block; width: 100%; margin-top: 3px; }
+input, select {
+  background: #0d1117; color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px;
+}
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.row3 label { margin: 0; }
+.chk { display: inline-flex; flex-direction: row; align-items: center; gap: 6px; color: var(--ink); }
+.chk input { width: auto; margin: 0; }
+
+.btn {
+  background: #21262d; color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 12px; cursor: pointer; font-size: 12px; font-weight: 600;
+}
+.btn:hover { border-color: var(--accent); }
+.btn.sm { padding: 5px 9px; font-weight: 500; }
+.btn.go { background: var(--accent); border-color: var(--accent); flex: 1; }
+
+details { margin-top: 8px; }
+summary { cursor: pointer; color: var(--accent); font-size: 12px; padding: 4px 0; }
+
+#stiff { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px 10px; margin-bottom: 10px; }
+.scell { font-size: 11px; color: var(--muted); }
+.scell input[type=range] { width: 100%; }
+.scell .sv { color: var(--ink); float: right; font-variant-numeric: tabular-nums; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; margin-bottom: 8px; }
+.stat { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.k { color: var(--muted); font-size: 12px; }
+.v { font-variant-numeric: tabular-nums; font-size: 12px; }
+
+.pill { padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #333b46; color: var(--ink); }
+.pill-good { background: var(--ok); }
+.pill-bad { background: var(--bad); }
+.pill-warn { background: var(--warn); color: #1b1b1b; }
+
+.msg {
+  margin-top: 6px; padding: 7px 10px; background: #0d1117; border: 1px solid var(--line);
+  border-radius: 7px; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace;
+}

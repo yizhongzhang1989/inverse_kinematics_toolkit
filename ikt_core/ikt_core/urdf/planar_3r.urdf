@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<!-- planar_3r: a 3-link planar arm, all joints revolute about +Z, lying in the
+     XY plane. Smallest sane IK test: position-only targets in the plane.
+     Tip frame: tool0. No meshes (primitive-free, license-clean). -->
+<robot name="planar_3r">
+  <link name="base_link"/>
+
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="50" velocity="3.0"/>
+  </joint>
+  <link name="link1"/>
+
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0.3 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.7" upper="2.7" effort="50" velocity="3.0"/>
+  </joint>
+  <link name="link2"/>
+
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0.3 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.7" upper="2.7" effort="50" velocity="3.0"/>
+  </joint>
+  <link name="link3"/>
+
+  <joint name="tool0_fixed" type="fixed">
+    <parent link="link3"/>
+    <child link="tool0"/>
+    <origin xyz="0.2 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="tool0"/>
+</robot>

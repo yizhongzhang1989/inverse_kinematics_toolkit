@@ -1,0 +1,239 @@
+:root {
+  --bg: #0e1116; --panel: rgba(20,25,33,.93); --card: #171c24; --line: #2a323d;
+  --fg: #e6edf3; --muted: #9aa7b4; --go: #1f8a4c; --stop: #b3331f;
+  --warn: #c9962b; --accent: #2f6fd1; --ok: #2ea043; --bad: #d1242f;
+}
+* { box-sizing: border-box; }
+/* Reliable hide for the simplified dashboard: overrides author display (grid/flex)
+   so the `hidden` attribute always collapses an element. Hidden items stay in the
+   DOM (the JS still updates them) and can be deleted later after review. */
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg); color: var(--fg); font-size: 13px;
+}
+
+/* The 3D area is a positioned container; the canvas fills it at 100%.
+   All 3D controls + data float on the canvas (see #view-float). */
+#stage { position: fixed; top: 0; right: 0; bottom: 0; left: 360px; overflow: hidden; }
+#viewer { display: block; width: 100%; height: 100%; cursor: grab; }
+#viewer:active { cursor: grabbing; }
+
+#loading {
+  position: fixed; inset: 0 0 0 360px; display: flex; align-items: center;
+  justify-content: center; flex-direction: column; gap: 14px;
+  color: var(--muted); font-size: 15px; z-index: 5;
+}
+.spinner {
+  width: 38px; height: 38px; border: 4px solid #30363d; border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* top-left on the canvas: connection + live commanded-target readout */
+#hud {
+  position: absolute; top: 10px; left: 12px; z-index: 8;
+  display: flex; gap: 10px; align-items: center; pointer-events: none;
+}
+#hud .pill { pointer-events: auto; }
+
+#panel {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 360px; z-index: 10;
+  background: var(--panel); backdrop-filter: blur(6px);
+  border-right: 1px solid var(--line); padding: 14px 16px 40px; overflow-y: auto;
+}
+#panel h1 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+.muted { color: var(--muted); font-weight: normal; font-size: 11px; }
+.sm { font-size: 11px; }
+.warn { color: var(--warn); font-weight: 500; font-size: 11px; }
+
+.card {
+  background: rgba(13,17,23,.5); border: 1px solid var(--line);
+  border-radius: 9px; padding: 12px; margin-bottom: 12px;
+}
+.card h2 {
+  font-size: 12px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .03em;
+}
+
+label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+label > input, label > select { display: block; width: 100%; margin-top: 3px; }
+input, select {
+  background: #0d1117; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px;
+}
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.row4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+.row3 label, .row4 label { margin: 0; }
+
+.btn {
+  background: #21262d; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 12px; cursor: pointer; font-size: 12px; font-weight: 600;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.sm { padding: 6px 9px; font-weight: 500; }
+.btn.sm.sel { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-go { background: var(--go); border-color: var(--go); }
+.btn-stop { background: var(--stop); border-color: var(--stop); }
+#btn-configure, #btn-disable { flex: 1; min-width: 90px; }
+.psub { margin: 12px 0 4px; font-size: 11px; font-weight: 600; letter-spacing: .05em;
+        text-transform: uppercase; color: var(--accent); opacity: .85; }
+
+/* ---- per-DOF stiffness sliders ---- */
+.stiff-head { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+.stiff-grid { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.stiff-row { display: grid; grid-template-columns: 28px 1fr 40px; align-items: center; gap: 8px; }
+.stiff-lbl { font-size: 11px; font-weight: 700; color: var(--accent); text-align: center; }
+.stiff-row input[type="range"] {
+  width: 100%; margin: 0; padding: 0; background: transparent; border: none;
+  accent-color: var(--accent); cursor: pointer;
+}
+.stiff-val {
+  font-size: 11px; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace;
+  color: var(--fg); text-align: right;
+}
+
+.jog { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; max-width: 220px; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; margin-top: 10px; }
+.stat { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.k { color: var(--muted); font-size: 12px; }
+.v { font-variant-numeric: tabular-nums; font-size: 12px; text-align: right; }
+
+.pill { padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; background: #333b46; color: var(--fg); }
+.pill-good { background: var(--ok); }
+.pill-bad { background: var(--bad); }
+.pill-warn { background: var(--warn); color: #1b1b1b; }
+
+.tgt-live { color: #39d353; font-size: 12px; font-variant-numeric: tabular-nums; }
+.tgt-stale { color: var(--warn); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.msg {
+  margin-top: 8px; padding: 7px 10px; background: #0d1117; border: 1px solid var(--line);
+  border-radius: 7px; color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace;
+  word-break: break-word;
+}
+
+/* ---- 3D link-name labels (HTML overlay above the canvas) ---- */
+#labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 4; }
+.lbl {
+  position: absolute; transform: translate(-50%, -50%);
+  padding: 1px 6px; border-radius: 5px; font-size: 11px; line-height: 1.4;
+  background: rgba(13, 17, 23, .72); color: var(--fg); border: 1px solid var(--line);
+  white-space: nowrap; pointer-events: auto; cursor: pointer; user-select: none;
+}
+.lbl:hover { border-color: var(--accent); }
+.lbl.sel { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+/* fixed-joint marker on the 3D canvas (distinct from plain link labels) */
+.lbl.fixed {
+  background: rgba(201, 150, 43, .92); border-color: var(--warn);
+  color: #1a1205; font-weight: 700; letter-spacing: .2px; z-index: 6;
+}
+
+/* ---- fixed-joints checkbox list (Configure card) ---- */
+.fj-block { margin-bottom: 10px; }
+.fj-head { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+.fj-list {
+  max-height: 168px; overflow-y: auto; border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px; background: rgba(13,17,23,.4);
+}
+.fj-row {
+  display: flex; align-items: center; gap: 7px; margin: 0; padding: 3px 5px;
+  border-radius: 4px; font-size: 12px; color: var(--fg); cursor: pointer;
+}
+.fj-row:hover { background: rgba(255,255,255,.04); }
+.fj-row > input { width: auto; margin: 0; display: inline-block; flex: none; accent-color: var(--warn); }
+.fj-row .fj-name { flex: 1 1 auto; font-variant-numeric: tabular-nums; }
+.fj-row.is-fixed { background: rgba(201,150,43,.13); }
+.fj-row.is-fixed .fj-name { color: var(--warn); font-weight: 600; }
+.fj-tag {
+  font-size: 9px; font-weight: 700; letter-spacing: .4px; color: #1a1205;
+  background: var(--warn); border-radius: 3px; padding: 1px 5px;
+}
+
+/* ---- checkbox row (3D view options) ---- */
+.chk {
+  display: inline-flex; flex-direction: row; align-items: center; gap: 6px;
+  color: var(--fg); font-size: 12px; margin: 0;
+}
+.chk input { width: auto; margin: 0; }
+
+/* =========================================================================
+   Floating overlay ON the 3D canvas (top-right): all 3D-view controls and
+   live data (joint angles + TCP pose) live here, directly over the canvas —
+   mirrors external/cartesian_controllers_toolkit/cartesian_controller_dashboard.
+   ========================================================================= */
+#view-float {
+  position: absolute; top: 10px; right: 10px; z-index: 9;
+  width: 250px; max-height: calc(100% - 20px); overflow: auto;
+  background: rgba(20, 25, 33, 0.94); border: 1px solid rgba(47, 111, 209, 0.40);
+  border-radius: 9px; padding: 10px 12px 12px; color: var(--fg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.vf-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.vf-title { font-size: 13px; font-weight: 600; color: var(--fg); flex: 1; }
+.vf-toggle {
+  flex: 0 0 auto; width: 22px; height: 22px; padding: 0; border-radius: 5px;
+  border: 1px solid var(--line); background: #21262d; color: var(--fg);
+  font-size: 15px; font-weight: 700; line-height: 1; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.vf-toggle:hover { border-color: var(--accent); }
+#view-float.collapsed { width: auto; }
+#view-float.collapsed .vf-header { margin-bottom: 0; }
+#view-float.collapsed .vf-body { display: none; }
+
+.vf-rows {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+  margin-bottom: 9px; font-size: 11px;
+}
+.vf-rows > span:nth-child(odd) {
+  color: var(--muted); text-transform: uppercase; letter-spacing: .04em;
+}
+.vf-rows > .num {
+  font-variant-numeric: tabular-nums; color: var(--fg); text-align: right;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.vf-controls { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.vf-controls label {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  font-size: 12px; color: var(--fg); margin: 0;
+}
+.vf-controls input { width: auto; margin: 0; }
+.vf-buttons { display: flex; gap: 6px; margin-bottom: 8px; }
+.vf-buttons .btn { flex: 1; }
+.vf-section {
+  font-size: 10px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .08em; margin: 6px 0 5px; border-top: 1px solid var(--line);
+  padding-top: 7px;
+}
+.vf-section .muted { text-transform: none; letter-spacing: 0; }
+.vf-hint { margin-top: 8px; font-size: 10px; color: #6a7282; line-height: 1.35; }
+
+/* ---- joint bars (centre-line fill, per-joint color) ---- */
+.vf-joints { display: flex; flex-direction: column; gap: 3px; }
+.jbrow { display: grid; grid-template-columns: 22px 1fr 46px; align-items: center;
+  gap: 6px; height: 18px; }
+.jblabel { font-size: 11px; font-weight: 700; text-align: center; }
+.jbbg {
+  position: relative; height: 12px; background: #0f1923; border-radius: 3px;
+  overflow: hidden; box-shadow: inset 0 0 0 1px rgba(55, 71, 79, 0.55);
+}
+.jbcenter { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px;
+  background: #37474f; z-index: 2; }
+.jbbar { position: absolute; top: 0; height: 100%; border-radius: 2px;
+  transition: width .06s ease-out; }
+.jbval { text-align: right; font-size: 11px; font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, monospace; color: var(--fg); white-space: nowrap; }
+
+/* ---- TCP pose (on the overlay) ---- */
+.vf-tcp { display: flex; flex-direction: column; gap: 3px; }
+.vf-tcp .trow { display: grid; grid-template-columns: 40px 1fr; gap: 8px;
+  align-items: baseline; font-size: 11px; }
+.vf-tcp .k { color: var(--muted); }
+.vf-tcp .v { font-variant-numeric: tabular-nums; text-align: left;
+  word-break: break-word; }
+

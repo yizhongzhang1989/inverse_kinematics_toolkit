@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ikt_common</name>
+  <version>0.1.0</version>
+  <description>Centralised configuration loader and workspace utilities shared by all packages in the cartesian_controllers_toolkit. Named ikt_common (cartesian_controllers_toolkit common) so the toolkit can be dropped into any workspace as a submodule without colliding with a host package named 'common'.</description>
+
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

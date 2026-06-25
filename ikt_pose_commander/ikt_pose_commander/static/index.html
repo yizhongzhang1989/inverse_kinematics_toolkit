@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ikt_pose_commander — 3D</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/vendor/three.module.js",
+      "three/addons/": "/static/vendor/addons/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <!-- 3D viewer fills the area to the right of the panel. All 3D-related
+       controls and live data float DIRECTLY on the canvas as overlays
+       (mirrors external/cartesian_controllers_toolkit/cartesian_controller_dashboard). -->
+  <div id="stage">
+    <canvas id="viewer"></canvas>
+    <div id="labels"></div>
+
+    <!-- top-left: connection + live commanded-target readout -->
+    <div id="hud">
+      <span id="conn" class="pill pill-bad">connecting…</span>
+      <span id="tgt-read" class="muted">no target yet</span>
+    </div>
+
+    <!-- top-right floating overlay: 3D controls + live data, on the canvas -->
+    <div id="view-float">
+      <div class="vf-header">
+        <span class="vf-title">3D View</span>
+        <span class="pill" id="model-pill">—</span>
+        <button id="vf-collapse" type="button" class="vf-toggle"
+                aria-expanded="true" title="Collapse">−</button>
+      </div>
+      <div class="vf-body" id="vf-body">
+        <div class="vf-rows">
+          <span>links</span><span class="num" id="n-links">—</span>
+          <span>joints</span><span class="num" id="n-joints">—</span>
+          <span>selected</span><span class="num" id="sel-link">—</span>
+        </div>
+        <div class="vf-controls">
+          <label><input type="checkbox" id="show-mesh" checked> mesh</label>
+          <label><input type="checkbox" id="show-labels" checked> labels</label>
+          <label><input type="checkbox" id="show-frames"> frames</label>
+        </div>
+        <div class="vf-buttons">
+          <button id="fit" type="button" class="btn sm">Fit view</button>
+        </div>
+        <div class="vf-section">Joint angles</div>
+        <div class="vf-joints" id="joint-bars"><div class="muted sm">waiting for model…</div></div>
+        <div class="vf-section">TCP pose <span class="muted" id="tcp-frame"></span></div>
+        <div class="vf-tcp" id="tcp-pose"><div class="muted sm">no controlled frame</div></div>
+        <div class="vf-hint">drag to orbit &middot; wheel to zoom &middot; pick the control link in the panel</div>
+      </div>
+    </div>
+  </div>
+  <div id="loading"><div class="spinner"></div>Waiting for /robot_description…</div>
+
+  <div id="panel">
+    <h1>Pose Commander <span class="muted">· 3D target view</span></h1>
+
+    <!-- Configure (robot-independent: pick the link from the live URDF) -->
+    <section class="card">
+      <h2>Configure <span class="warn">(pick the link to control)</span></h2>
+      <label>controlled link
+        <select id="link-select"><option value="">— loading from URDF —</option></select>
+      </label>
+      <label>base link <span class="muted">(target reference frame)</span>
+        <select id="base-select"><option value="">(robot root)</option></select>
+      </label>
+      <div class="fj-block">
+        <div class="fj-head">fixed joints <span class="muted">(held out of IK — e.g. a lifter; tick to freeze)</span></div>
+        <div id="fixed-joints-list" class="fj-list"><div class="muted sm">waiting for model…</div></div>
+      </div>
+      <button id="btn-configure" class="btn btn-go">Configure</button>
+    </section>
+
+    <!-- Dashboard mode: Read (monitor the live target) vs Send (control it) -->
+    <section class="card">
+      <h2>Mode <span class="muted">(read / send target pose)</span></h2>
+      <div class="row">
+        <button id="btn-mode-read" type="button" class="btn sm sel">Read (monitor)</button>
+        <button id="btn-mode-send" type="button" class="btn sm">Send (control)</button>
+      </div>
+      <div class="vf-hint" id="mode-hint">Read: the target frame follows the live commanded target (e.g. from the SpaceMouse) — nothing is sent. Send: drag the frame to command the robot.</div>
+    </section>
+
+    <!-- Target frame (the goal pose the controlled link will be driven to match) -->
+    <section class="card">
+      <h2>Target frame <span class="muted" id="grab-frame"></span></h2>
+      <div class="row" id="tf-ctl-row">
+        <button id="gizmo-move" type="button" class="btn sm sel">move</button>
+        <button id="gizmo-rotate" type="button" class="btn sm">rotate</button>
+        <button id="btn-snap-target" type="button" class="btn sm">Snap target → link</button>
+      </div>
+      <div class="vf-hint" id="grab-hint">Drag the target frame in 3D (move / rotate handles). <b>Snap target → link</b> resets it onto the selected control link. Then <b>Snap robot</b> (one move) or <b>Track robot</b> (live) below.</div>
+    </section>
+
+    <!-- Enable / disable -->
+    <section class="card">
+      <h2>Engage <span class="warn">(commands the real robot)</span></h2>
+      <div class="row" id="engage-ctl-row">
+        <button id="btn-snap-robot" class="btn btn-go">Snap robot (jtc)</button>
+        <button id="btn-track-robot" class="btn btn-go">Track robot (fpc)</button>
+      </div>
+      <div class="row">
+        <button id="btn-disable" class="btn btn-stop">Stop / Disengage</button>
+      </div>
+    </section>
+
+    <!-- IK & motion parameters: every field applies LIVE on change (the
+         commander accepts these even while enabled). base_frame lives in the
+         Configure card above. -->
+    <section class="card">
+      <h2>Parameters <span class="muted">(applied live)</span></h2>
+      <div class="psub">IK solver</div>
+      <div class="stiff-head">DOF stiffness <span class="muted">(0 = free · 1 = rigid)</span></div>
+      <div class="stiff-grid">
+        <div class="stiff-row"><span class="stiff-lbl">X</span><input type="range" class="stiff-dof" id="p-stiff-0" data-out="v-stiff-0" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-0">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">Y</span><input type="range" class="stiff-dof" id="p-stiff-1" data-out="v-stiff-1" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-1">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">Z</span><input type="range" class="stiff-dof" id="p-stiff-2" data-out="v-stiff-2" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-2">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">RX</span><input type="range" class="stiff-dof" id="p-stiff-3" data-out="v-stiff-3" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-3">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">RY</span><input type="range" class="stiff-dof" id="p-stiff-4" data-out="v-stiff-4" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-4">1.00</span></div>
+        <div class="stiff-row"><span class="stiff-lbl">RZ</span><input type="range" class="stiff-dof" id="p-stiff-5" data-out="v-stiff-5" min="0" max="1" step="0.05" value="1" /><span class="stiff-val" id="v-stiff-5">1.00</span></div>
+      </div>
+      <label><input type="checkbox" id="p-allow-unreach" data-key="allow_unreachable"> allow_unreachable (best-effort stretch)</label>
+      <div class="row3">
+        <label>reach gain <input id="p-reach-gain" type="number" data-key="reach_gain" step="0.05" min="0.001" max="1" /></label>
+        <label>centering wt <input id="p-centering" type="number" data-key="joint_centering_weight" step="0.005" min="0" /></label>
+        <label>damping <input id="p-damping" type="number" data-key="damping" step="0.005" min="0" /></label>
+      </div>
+      <div class="row3">
+        <label>tol pos (m) <input id="p-tol-pos" type="number" data-key="tol_pos" step="0.0005" min="0" /></label>
+        <label>tol ori (rad) <input id="p-tol-ori" type="number" data-key="tol_ori" step="0.0005" min="0" /></label>
+        <label>max iters <input id="p-max-iters" type="number" data-key="max_iters" data-int="1" step="10" min="1" /></label>
+      </div>
+      <div class="psub">Motion &amp; safety</div>
+      <div class="row3">
+        <label>max joint speed <input id="p-max-speed" type="number" data-key="max_joint_speed" step="0.05" min="0.001" /></label>
+        <label>min move time (s) <input id="p-min-time" type="number" data-key="min_move_time" step="0.1" min="0" /></label>
+        <label>max step (rad) <input id="p-max-step" type="number" data-key="max_step_rad" step="0.05" min="0" /></label>
+      </div>
+      <div class="row3">
+        <label>stale after (s) <input id="p-js-stale" type="number" data-key="joint_states_stale_after" step="0.1" min="0" /></label>
+        <label>control rate (Hz) <input id="p-control-rate" type="number" data-key="control_rate_hz" step="5" min="0" max="250" /></label>
+      </div>
+    </section>
+
+    <div class="msg" id="action-msg"></div>
+  </div>
+
+  <!-- control panel logic (classic script; unchanged API) -->
+  <script src="/static/dashboard.js"></script>
+  <!-- 3D viewer (module): robot + live target triad -->
+  <script type="module" src="/static/viewer.js"></script>
+</body>
+</html>

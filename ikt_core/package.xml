@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ikt_core</name>
+  <version>0.1.0</version>
+  <description>
+    Robot-agnostic, ROS-free inverse-kinematics core: a Pinocchio-backed
+    weighted LM-DLS solver addressable by frame/joint name, with multi-tip and
+    arbitrary-link / virtual-tool-frame pose solving, per-DOF task stiffness,
+    joint limits, singularity robustness, rest-posture bias, arm-angle (S-R-S)
+    redundancy control, a dual-arm relative-pose constraint, a reachability
+    verdict, and a high-level IK class + solve_ik() one-liner. Loads a URDF from
+    a file, a .xacro, stdin or a raw string, and ships small sample URDFs. Pure
+    Python (numpy + pinocchio); imports no rclpy, so it is usable as an ordinary
+    Python library as well as a colcon/ament package. Advisory only: it returns
+    joint solutions, never commands a robot.
+  </description>
+
+  <maintainer email="yizhongzhang1989@gmail.com">yizhongzhang</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

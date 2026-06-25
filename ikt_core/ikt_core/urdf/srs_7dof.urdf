@@ -1,0 +1,104 @@
+<?xml version="1.0"?>
+<!-- srs_7dof: a 7-DOF Spherical-Revolute-Spherical arm.
+     J1-J2-J3 form the (intersecting) shoulder, J4 the elbow, J5-J6-J7 the
+     (intersecting) wrist. The 1-D null space is the elbow swivel = arm angle
+     (psi). Named frames shoulder_link / elbow_link / wrist_link mark the S/E/W
+     points used by ikt_inverse_kinematics.arm_angle. Tip frame: tool0.
+     Primitive-free, license-clean. -->
+<robot name="srs_7dof">
+  <link name="base_link"/>
+
+  <!-- shoulder: J1 (yaw) + J2 (pitch) + J3 (humeral roll), intersecting -->
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.20" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link1"/>
+
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.0" upper="2.0" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link2"/>
+
+  <joint name="shoulder_fixed" type="fixed">
+    <parent link="link2"/>
+    <child link="shoulder_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="shoulder_link"/>
+
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link3"/>
+
+  <!-- elbow: J4 (pitch), upper-arm length 0.30 -->
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0 0 0.30" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.6" upper="2.6" effort="100" velocity="3.0"/>
+  </joint>
+  <link name="link4"/>
+
+  <joint name="elbow_fixed" type="fixed">
+    <parent link="link4"/>
+    <child link="elbow_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="elbow_link"/>
+
+  <!-- wrist: J5 (roll) + J6 (pitch) + J7 (roll), intersecting; forearm 0.30 -->
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0 0.30" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="50" velocity="3.5"/>
+  </joint>
+  <link name="link5"/>
+
+  <joint name="wrist_fixed" type="fixed">
+    <parent link="link5"/>
+    <child link="wrist_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="wrist_link"/>
+
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.0" upper="2.0" effort="50" velocity="3.5"/>
+  </joint>
+  <link name="link6"/>
+
+  <joint name="joint7" type="revolute">
+    <parent link="link6"/>
+    <child link="link7"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14159" upper="3.14159" effort="50" velocity="3.5"/>
+  </joint>
+  <link name="link7"/>
+
+  <joint name="tool0_fixed" type="fixed">
+    <parent link="link7"/>
+    <child link="tool0"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+  </joint>
+  <link name="tool0"/>
+</robot>
