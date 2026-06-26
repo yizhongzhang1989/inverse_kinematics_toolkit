@@ -104,12 +104,6 @@ _LIVE_KEYS = (
     "control_rate_hz",
     "singularity_decouple", "singularity_sigma", "singularity_exit_ratio",
     "joint_speed_limits", "joint_accel_limits",
-    # target_mode = how an incoming target updates the internal goal pose:
-    #   "absolute" (default) = ~/target_pose SETS it; "delta" = ~/target_delta
-    #   transforms COMPOSE onto it (the SpaceMouse delta path). delta_frame =
-    #   the frame a delta is expressed in ("base" = the model root, "tool" = the
-    #   controlled frame's own axes); it should match the teleop's jog_frame.
-    "target_mode", "delta_frame",
 )
 _STRUCTURAL_KEYS = (
     "controlled_frame", "joints", "fixed_joints", "jtc_controller",
@@ -131,37 +125,6 @@ _JTC_DEADBAND_RAD = 1e-3
 _CONTROL_RATE_MAX_HZ = 250.0
 
 
-def _quat_normalize_wxyz(q) -> np.ndarray:
-    """Return ``q`` (w, x, y, z) normalised to unit length; identity if ~zero."""
-    q = np.asarray(q, dtype=float)
-    n = float(np.linalg.norm(q))
-    if n < 1e-12:
-        return np.array([1.0, 0.0, 0.0, 0.0])
-    return q / n
-
-
-def _quat_mul_wxyz(a, b) -> np.ndarray:
-    """Hamilton product ``a (x) b`` for ``(w, x, y, z)`` quaternions."""
-    aw, ax, ay, az = (float(v) for v in a)
-    bw, bx, by, bz = (float(v) for v in b)
-    return np.array([
-        aw * bw - ax * bx - ay * by - az * bz,
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-    ])
-
-
-def _quat_to_R_wxyz(q) -> np.ndarray:
-    """3x3 rotation matrix (body->world) for a ``(w, x, y, z)`` quaternion."""
-    w, x, y, z = _quat_normalize_wxyz(q)
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
-
-
 class PoseCommander(Node):
     def __init__(self) -> None:
         super().__init__("ikt_pose_commander")
@@ -170,18 +133,6 @@ class PoseCommander(Node):
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("target_pose_topic", "~/target_pose")
-        # Delta-pose input (Req: delta mode). In ``target_mode: delta`` an
-        # incremental transform on this topic is COMPOSED onto the internal
-        # target instead of an absolute pose replacing it -> the SpaceMouse (or
-        # any source) can stream small deltas without knowing the robot's pose.
-        self.declare_parameter("target_delta_topic", "~/target_delta")
-        # target_mode: "absolute" = ~/target_pose SETS the goal (the classic
-        # path); "delta" = ~/target_delta transforms COMPOSE onto the goal. Live.
-        self.declare_parameter("target_mode", "absolute")
-        # delta_frame: the frame a delta is expressed in. "base" = the model
-        # root (world-frame increment); "tool" = the controlled frame's own axes
-        # (body increment). Match this to the teleop's jog_frame. Live.
-        self.declare_parameter("delta_frame", "base")
         # base_frame: the frame a target with an EMPTY ``header.frame_id`` is
         # assumed to be expressed in. Every target is transformed into the model
         # root for the solver, so any TF frame works as a reference. Live /
@@ -277,9 +228,6 @@ class PoseCommander(Node):
         self._desc_topic = str(gp("robot_description_topic").value)
         self._js_topic = str(gp("joint_states_topic").value)
         self._target_topic = str(gp("target_pose_topic").value)
-        self._delta_topic = str(gp("target_delta_topic").value)
-        self._target_mode = self._norm_target_mode(gp("target_mode").value)
-        self._delta_frame = self._norm_delta_frame(gp("delta_frame").value)
         self._base_frame = str(gp("base_frame").value or "")
         # Active config (may start empty -> unconfigured). Filled by _apply_config.
         self._frame = str(gp("controlled_frame").value or "")
@@ -348,12 +296,14 @@ class PoseCommander(Node):
         self._enabled = False
         self._configured = False
         self._last_msg = "initialised (disabled, unconfigured)"
-        # Throttle repeated _set_msg logs: a high-rate target stream into a
-        # disabled/unconfigured commander would otherwise flood the log at the
-        # stream rate. We always update the status field, but only emit an INFO
-        # line when the message text changes or a heartbeat interval elapses.
-        self._last_logged_msg = ""
-        self._last_log_time = 0.0
+        # Throttle repeated _set_msg logs PER DISTINCT MESSAGE: the SpaceMouse
+        # pose_node streams BOTH curr_pose and delta_pose at 100 Hz, so a
+        # disabled commander can get two DIFFERENT "ignored" messages
+        # interleaved -- a single last-message dedupe is defeated by the
+        # alternation and floods the console. Key the throttle by message text so
+        # each distinct line is emitted at most once per heartbeat interval (the
+        # status field is still updated every call).
+        self._log_times: Dict[str, float] = {}
         self._last_target_stamp = 0.0
         self._last_solution = None
         self._last_reason = ""
@@ -434,10 +384,6 @@ class PoseCommander(Node):
                                  callback_group=cb)
         self.create_subscription(PoseStamped, self._target_topic,
                                  self._on_target, 10, callback_group=cb)
-        # Delta-pose stream (delta mode): each message is an INCREMENTAL
-        # transform composed onto the internal target (not an absolute pose).
-        self.create_subscription(PoseStamped, self._delta_topic,
-                                 self._on_target_delta, 10, callback_group=cb)
         self.create_subscription(String, "~/configure",
                                  self._on_configure, 10, callback_group=cb)
         # Controller-dependent endpoints are (re)created on configure.
@@ -509,9 +455,9 @@ class PoseCommander(Node):
         self.get_logger().info(
             "ikt_pose_commander up (DISABLED, %s). Reads /robot_description "
             "online; configure by naming the link to control (~/configure or "
-            "the dashboard), then ~/enable. mode=%s target_mode=%s"
+            "the dashboard), then ~/enable. mode=%s"
             % ("pre-configured for '%s'" % self._frame if self._frame
-               else "UNCONFIGURED", self._mode, self._target_mode))
+               else "UNCONFIGURED", self._mode))
 
     # ------------------------------------------------------------------ #
     # Subscriptions
@@ -735,12 +681,6 @@ class PoseCommander(Node):
             if "base_frame" in req and req["base_frame"] is not None:
                 self._base_frame = str(req["base_frame"] or "")
                 changed.append("base_frame=%s" % (self._base_frame or "(root)"))
-            if req.get("target_mode") is not None:
-                self._target_mode = self._norm_target_mode(req["target_mode"])
-                changed.append("target_mode=%s" % self._target_mode)
-            if req.get("delta_frame") is not None:
-                self._delta_frame = self._norm_delta_frame(req["delta_frame"])
-                changed.append("delta_frame=%s" % self._delta_frame)
             # Any live change must re-drive the robot. Invalidate the goal +
             # rejection caches so the background control loop (control_rate_hz>0)
             # RE-SOLVES the stored target on its next tick with the new settings,
@@ -790,18 +730,6 @@ class PoseCommander(Node):
             if f > 0.0:
                 out[str(k)] = f
         return out
-
-    @staticmethod
-    def _norm_target_mode(value) -> str:
-        """Normalise target_mode to 'absolute' | 'delta' (default absolute)."""
-        v = str(value or "").strip().lower()
-        return "delta" if v == "delta" else "absolute"
-
-    @staticmethod
-    def _norm_delta_frame(value) -> str:
-        """Normalise delta_frame to 'base' | 'tool' (default base)."""
-        v = str(value or "").strip().lower()
-        return "tool" if v == "tool" else "base"
 
     def _reconcile_control_timer(self) -> None:
         """Create/destroy/retune the control-loop timer to match _control_rate.
@@ -1152,15 +1080,6 @@ class PoseCommander(Node):
             model = self._model
             configured = self._configured
             rate = self._control_rate
-            mode = self._target_mode
-        if mode != "absolute":
-            # Delta mode: an absolute pose on ~/target_pose is ignored so the
-            # SpaceMouse delta stream is the single source of truth (avoids the
-            # two-publisher tug-of-war). Switch target_mode to 'absolute' to use
-            # ~/target_pose (the dashboard gizmo / send_pose path).
-            self._set_msg("target_pose ignored: target_mode is 'delta' "
-                          "(use ~/target_delta, or set target_mode=absolute)")
-            return
         if not configured:
             self._set_msg("target ignored: UNCONFIGURED (set the link via "
                           "~/configure or the dashboard)")
@@ -1186,88 +1105,6 @@ class PoseCommander(Node):
             self._last_target = (xyz, quat)
         if rate <= 0.0:
             self._process_target(model, xyz, quat)
-
-    def _on_target_delta(self, msg: PoseStamped) -> None:
-        """Compose an incremental transform onto the internal target (delta mode).
-
-        ``msg`` is read as a SMALL delta pose, NOT an absolute target: its
-        position is a translation increment and its orientation a rotation
-        increment (identity = no change). The delta is applied in ``delta_frame``
-        ("base" = the model root, world-frame increment; "tool" = the controlled
-        frame's own axes, body increment), exactly mirroring the teleop's
-        ``jog_frame`` integration -- but here the commander owns the target pose,
-        so the SpaceMouse never needs the robot's TF. The internal goal is seeded
-        from the current frame pose on enable (and on the first delta if unset),
-        so deltas accumulate from where the arm actually is.
-        """
-        with self._lock:
-            enabled = self._enabled
-            model = self._model
-            configured = self._configured
-            rate = self._control_rate
-            mode = self._target_mode
-            delta_frame = self._delta_frame
-            have_tgt = self._last_target is not None
-        if mode != "delta":
-            self._set_msg("delta ignored: target_mode is 'absolute' "
-                          "(set target_mode=delta to jog with deltas)")
-            return
-        if not configured:
-            self._set_msg("delta ignored: UNCONFIGURED (set the link first)")
-            return
-        if not enabled:
-            self._set_msg("delta ignored: commander DISABLED (call ~/enable)")
-            return
-        if model is None:
-            self._set_msg("delta ignored: no robot_description yet")
-            return
-        if not self._js_fresh():
-            self._set_msg("delta ignored: /joint_states stale")
-            return
-        # Seed the goal from the live frame pose if no target exists yet, so the
-        # first delta accumulates from the current pose (no jump).
-        if not have_tgt:
-            ok, _m = self._snap_target()
-            if not ok:
-                return
-
-        p, o = msg.pose.position, msg.pose.orientation
-        dp = np.array([p.x, p.y, p.z], dtype=float)
-        dq = _quat_normalize_wxyz([o.w, o.x, o.y, o.z])
-
-        with self._lock:
-            tgt = self._last_target
-            if tgt is None:
-                return
-            new_xyz, new_quat = self._apply_delta(
-                tgt[0], tgt[1], dp, dq, delta_frame)
-            self._last_target = (new_xyz, new_quat)
-            self._last_target_stamp = time.monotonic()
-            # A moved target invalidates the rejection cache (the goal/target
-            # caches are keyed on the pose and refreshed by _process_target).
-            self._rejected_target_xyz = None
-            self._rejected_target_quat = None
-        if rate <= 0.0:
-            self._process_target(model, new_xyz, new_quat)
-
-    @staticmethod
-    def _apply_delta(p, q, dp, dq, frame: str):
-        """Compose a delta (dp, dq) onto pose (p, q) in ``frame`` (base|tool).
-
-        Quaternions are (w, x, y, z). ``base`` = a world-frame increment
-        (translate along the model-root axes, left-multiply the rotation);
-        ``tool`` = a body-frame increment (translate along the current frame
-        axes, right-multiply). Mirrors twist_integrator.integrate_pose.
-        """
-        p = np.asarray(p, dtype=float)
-        q = _quat_normalize_wxyz(q)
-        if frame == "tool":
-            new_p = p + _quat_to_R_wxyz(q) @ dp
-            new_q = _quat_mul_wxyz(q, dq)        # body increment -> right-multiply
-        else:  # base / model root
-            new_p = p + dp
-            new_q = _quat_mul_wxyz(dq, q)        # world increment -> left-multiply
-        return new_p, _quat_normalize_wxyz(new_q)
 
     def _process_target(self, model, xyz, quat) -> None:
         """Solve IK for one target and command it through the safety gates.
@@ -1832,13 +1669,6 @@ class PoseCommander(Node):
             self._last_best_effort = False
         self._set_msg(
             "ENABLED (mode=%s, controller=%s)" % (mode, want))
-        # In delta mode, seed the internal goal from the current frame pose so
-        # the first incoming delta accumulates from where the arm actually is
-        # (no jump). Absolute mode waits for a target on ~/target_pose.
-        with self._lock:
-            target_mode = self._target_mode
-        if target_mode == "delta":
-            self._snap_target()
         return True, "enabled"
 
     def _srv_disable(self, request, response):
@@ -2007,13 +1837,17 @@ class PoseCommander(Node):
     def _set_msg(self, msg: str) -> None:
         with self._lock:
             self._last_msg = msg
-        # Dedupe + heartbeat-throttle: only log when the text changes or after a
-        # quiet interval, so a 50 Hz target stream doesn't spam the console.
+        # Per-message heartbeat throttle: emit a given text at most once per 5 s.
+        # Keying by text (not just the LAST message) means two interleaved
+        # high-rate streams with different "ignored" messages can't defeat each
+        # other's dedupe and flood the console (see __init__).
         now = time.monotonic()
-        if msg == self._last_logged_msg and (now - self._last_log_time) < 5.0:
+        if (now - self._log_times.get(msg, 0.0)) < 5.0:
             return
-        self._last_logged_msg = msg
-        self._last_log_time = now
+        self._log_times[msg] = now
+        if len(self._log_times) > 64:
+            # bound memory if many distinct messages occur over time
+            del self._log_times[min(self._log_times, key=self._log_times.get)]
         self.get_logger().info("[commander] %s" % msg)
 
     def _publish_status(self) -> None:
@@ -2044,15 +1878,11 @@ class PoseCommander(Node):
             allow_unreachable = self._allow_unreachable
             reach_gain = self._reach_gain
             best_effort = self._last_best_effort
-            target_mode = self._target_mode
-            delta_frame = self._delta_frame
             last_target = self._last_target
         status = {
             "enabled": enabled,
             "configured": configured,
             "mode": mode,
-            "target_mode": target_mode,
-            "delta_frame": delta_frame,
             "controlled_frame": frame,
             "base_frame": self._base_frame or "(model root)",
             "joints": joints,

@@ -5,7 +5,7 @@
 // configuration (per-link FK computed server-side, mirrored from the
 // ikt_inverse_kinematics dashboard) PLUS a triad + sphere at the *commanded
 // target pose* (whatever is currently on <ns>/target_pose — the dashboard's own
-// jog/send OR the spacemouse_servo teleop bridge).
+// jog/send OR the SpaceMouse pose_node).
 //
 // On top of the basic robot + target view it adds (referring to the other
 // toolkit dashboards):

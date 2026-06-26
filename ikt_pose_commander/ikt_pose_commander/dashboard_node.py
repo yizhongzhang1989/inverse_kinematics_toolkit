@@ -16,7 +16,7 @@ forward kinematics for rendering (same approach as the ikt_inverse_kinematics
 dashboard; this is the shared FK library, not commander internals), and it
 watches the same ``<ns>/target_pose`` topic it publishes to, so the marker
 tracks whatever source is driving the commander (its own jog/send OR the
-``spacemouse_servo`` bridge).
+SpaceMouse ``pose_node``).
 
 It also keeps its own TF listener so it can *capture* the controlled frame's
 current pose and *jog* it (capture → offset one axis → publish). The commander
@@ -216,7 +216,7 @@ class CommanderDashboard(Node):
         self._joint_tree: List[dict] = []
         self._joint_pos: Dict[str, float] = {}
         self._pkg_dirs: Dict[str, Optional[str]] = {}
-        # live commanded target (from <ns>/target_pose, incl. spacemouse_servo)
+        # live commanded target (from <ns>/target_pose or status; incl. pose_node)
         self._target: Optional[dict] = None
         self._target_stamp = 0.0
 
@@ -228,7 +228,7 @@ class CommanderDashboard(Node):
                                  qos_profile_sensor_data, callback_group=self._cbg)
         # Watch the same target topic we publish to, so the canvas shows the
         # live target regardless of who sent it (this dashboard's jog/send OR
-        # the spacemouse_servo teleop bridge).
+        # the SpaceMouse pose_node).
         self.create_subscription(PoseStamped, f"{self._ns}/target_pose",
                                  self._on_target, 10, callback_group=self._cbg)
         self._target_pub = self.create_publisher(
@@ -360,7 +360,7 @@ class CommanderDashboard(Node):
         """Live commanded target, expressed in the render (base) frame.
 
         Transforms from the message's ``frame_id`` to ``base_frame`` via TF when
-        they differ (the common spacemouse_servo case already publishes in the
+        they differ (the common SpaceMouse pose_node case already publishes in the
         base frame, so this is usually identity).
         """
         with self._lock:
@@ -395,9 +395,9 @@ class CommanderDashboard(Node):
     def _target_from_status(self) -> Optional[dict]:
         """The commander's internal goal pose (from ``~/status``), in the render
         frame. Used as a fallback for the 3D marker when nothing is publishing on
-        ``~/target_pose`` (e.g. after a snap, or while jogging in delta mode the
-        commander owns the goal and there is no absolute target stream). The
-        internal target is already in the model root frame (== base_frame here)."""
+        ``~/target_pose`` (e.g. after a snap, or before the bridge sends its
+        first target). The internal target is already in the model root frame
+        (== base_frame here)."""
         with self._lock:
             s = self._status
             stamp = self._status_stamp

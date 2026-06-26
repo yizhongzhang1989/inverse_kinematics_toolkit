@@ -82,17 +82,6 @@
       </div>
     </section>
 
-    <!-- Target mode: absolute (set the goal directly) vs delta (jog by
-         increments, e.g. from the SpaceMouse). -->
-    <section class="card">
-      <h2>Target mode <span class="muted">(how the goal is set)</span></h2>
-      <div class="row">
-        <button id="btn-tmode-absolute" type="button" class="btn sm sel">Absolute</button>
-        <button id="btn-tmode-delta" type="button" class="btn sm">Delta (jog)</button>
-      </div>
-      <div class="vf-hint" id="tmode-hint">Absolute: a target pose on <code>~/target_pose</code> (the 3D gizmo / send) sets the goal. Delta: incremental poses on <code>~/target_delta</code> (e.g. the SpaceMouse) are added to the goal; <b>Snap target → current pose</b> first to seed it.</div>
-    </section>
-
     <!-- Dashboard mode: Read (monitor the live target) vs Send (control it) -->
     <section class="card">
       <h2>Mode <span class="muted">(read / send target pose)</span></h2>

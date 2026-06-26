@@ -42,11 +42,6 @@ _FALLBACKS = {
     "fpc_controller": "",
     "start_enabled": "false",
     "base_frame": "",
-    # Target input: "absolute" = ~/target_pose sets the goal; "delta" =
-    # ~/target_delta increments it (the SpaceMouse delta path). delta_frame =
-    # "base" (model root) | "tool" (controlled-frame axes), match the teleop.
-    "target_mode": "absolute",
-    "delta_frame": "base",
     "switch_controllers": "true",
     "controller_manager": "/controller_manager",
     "max_joint_speed": 0.5,
@@ -109,11 +104,6 @@ def generate_launch_description():
         # Robot-neutral, from central config:
         DeclareLaunchArgument("command_mode",
                               default_value=str(d["command_mode"])),
-        # absolute | delta (see _FALLBACKS). delta = jog by incremental poses.
-        DeclareLaunchArgument("target_mode",
-                              default_value=str(d["target_mode"])),
-        DeclareLaunchArgument("delta_frame",
-                              default_value=str(d["delta_frame"])),
         DeclareLaunchArgument("start_enabled",
                               default_value=str(d["start_enabled"])),
         DeclareLaunchArgument("base_frame", default_value=str(d["base_frame"])),
@@ -169,8 +159,6 @@ def generate_launch_description():
             "jtc_controller": LaunchConfiguration("jtc_controller"),
             "fpc_controller": LaunchConfiguration("fpc_controller"),
             "command_mode": LaunchConfiguration("command_mode"),
-            "target_mode": LaunchConfiguration("target_mode"),
-            "delta_frame": LaunchConfiguration("delta_frame"),
             "start_enabled": LaunchConfiguration("start_enabled"),
             "base_frame": LaunchConfiguration("base_frame"),
             "joints": LaunchConfiguration("joints"),

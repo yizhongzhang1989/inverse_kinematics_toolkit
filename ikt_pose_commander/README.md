@@ -217,49 +217,45 @@ ros2 launch ikt_pose_commander commander.launch.py \
     fpc_controller:=forward_position_controller   # or jtc_controller:=arm_1_controller
 ```
 
-## Target modes: absolute vs delta + snapping
+## Setting the target + snapping
 
-How an incoming target updates the internal goal pose is selected by
-`target_mode` (a **live** key — settable at launch, via `~/configure`,
-`ros2 param set`, or the dashboard):
-
-| `target_mode` | input topic | meaning |
-|---|---|---|
-| `absolute` (default) | `~/target_pose` (`PoseStamped`) | the message **sets** the goal pose (TF-resolved into the solve frame) — the classic gizmo / `send_pose` path |
-| `delta` | `~/target_delta` (`PoseStamped`) | the message is a **small incremental transform** that is **composed onto** the goal — the SpaceMouse / jog path |
-
-In **delta** mode each `~/target_delta` message is read as a *delta*, not an
-absolute pose: its position is a translation increment and its orientation a
-rotation increment (identity = no change). The delta is applied in `delta_frame`
-(another live key):
-
-* `base` (default) — a **world-frame** increment: translate along the model-root
-  axes, the rotation is left-multiplied;
-* `tool` — a **body-frame** increment: translate along the controlled frame's own
-  axes, the rotation is right-multiplied.
-
-Set `delta_frame` to match the teleop's `jog_frame`. Because the commander owns
-the goal in delta mode, a teleop source (e.g. `spacemouse_teleop` with
-`output_mode:=delta`) only has to stream small deltas — it never needs the
-robot's TF or current pose. An absolute target on `~/target_pose` is **ignored**
-while in delta mode (and vice-versa), so there is no two-publisher tug-of-war.
+The commander drives the robot from an **absolute** target pose: a
+`geometry_msgs/PoseStamped` on `~/target_pose`, TF-resolved from its
+`header.frame_id` into the solver (model-root) frame. Each message **sets** the
+goal — the commander always tracks the **latest** one, so intermediate poses may
+be dropped freely (transport delay never corrupts the goal). This is the path
+used by the 3D gizmo, `send_pose`, scripts, and the SpaceMouse bridge below.
 
 **Snapping the goal to the current pose.** `~/snap_target` (`std_srvs/Trigger`)
 sets the internal goal to the controlled frame's **current pose** (forward
-kinematics of the measured joints). Use it to:
-
-* seed the goal **before delta jogging** so increments accumulate from where the
-  arm actually is (the commander also auto-snaps on `~/enable` when in delta
-  mode, and on the first delta if the goal is unset) — no jump;
-* **re-centre** the target onto the live pose at any time.
+kinematics of the measured joints). Use it to re-centre the target onto the live
+pose at any time (no jump). The dashboard's *Snap target → current pose* button
+calls it.
 
 ```bash
-# switch to delta jogging, then seed + jog
-ros2 param set /ikt_pose_commander target_mode delta
 ros2 service call /ikt_pose_commander/snap_target std_srvs/srv/Trigger
-# stream small base-frame deltas (+1 mm in x per message) on ~/target_delta
-ros2 topic pub /ikt_pose_commander/target_delta geometry_msgs/msg/PoseStamped \
-    '{header: {frame_id: base_link}, pose: {position: {x: 0.001}, orientation: {w: 1.0}}}'
+ros2 topic pub /ikt_pose_commander/target_pose geometry_msgs/msg/PoseStamped \
+    '{header: {frame_id: base_link}, pose: {position: {x: 0.6, y: 0.0, z: 0.6}, orientation: {w: 1.0}}}'
+```
+
+## SpaceMouse teleop (via `spacemouse_teleop`)
+
+The commander stays **device-agnostic**: SpaceMouse teleop is fed through the
+[`spacemouse_teleop`](../../../src/spacemouse_teleop) translator, which
+turns the 3Dconnexion `pose_node`'s absolute puck pose (`/spacemouse/curr_pose`)
+into an absolute `~/target_pose` anchored to the arm's current EE (jump-free).
+Every output is a full pose, so the commander tracks the latest and may drop
+intermediate ones. Run the SpaceMouse stack, the commander, and the bridge in
+separate terminals, then enable the commander:
+
+```bash
+ros2 launch spacemouse spacemouse.launch.py \
+    integration_frame:=world max_trans_speed:=0.15 max_rot_speed:=0.6 \
+    dashboard_port:=8080
+ros2 launch ikt_pose_commander commander.launch.py \
+    controlled_frame:=compliance_link dashboard_port:=8180
+ros2 launch spacemouse_teleop spacemouse_teleop.launch.py
+# enable from the :8180 dashboard (or `ros2 service call .../enable`), then jog
 ```
 
 ## Dashboard (optional, independent)

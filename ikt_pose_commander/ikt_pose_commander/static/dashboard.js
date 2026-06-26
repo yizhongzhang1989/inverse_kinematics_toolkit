@@ -115,13 +115,6 @@ async function poll() {
   }
 
   initParams(s);
-
-  // Reflect the commander's target_mode on the buttons (once, then leave the
-  // user's clicks alone — like the parameter inputs).
-  if (!_tmodeInit && s.target_mode) {
-    updateTargetModeUI(s.target_mode);
-    _tmodeInit = true;
-  }
 }
 
 function fixedJointsSelected() {
@@ -165,25 +158,10 @@ async function doConfigure() {
 
 // ---- Snap target -> current pose (server-side) ---------------------------
 // Tells the commander to snap its internal target onto the controlled frame's
-// CURRENT pose (FK of the measured joints) — seeds the goal before delta
-// jogging, or re-centres it with no jump.
+// CURRENT pose (FK of the measured joints) — re-centres the goal with no jump.
 async function doSnapCurrent() {
   const out = await postJSON("/api/snap_target", {});
   setMsg((out.ok ? "snapped: " : "snap failed: ") + (out.message || ""));
-}
-
-// ---- Target mode (absolute | delta) --------------------------------------
-let _tmodeInit = false;
-function updateTargetModeUI(mode) {
-  const ab = $("btn-tmode-absolute"), de = $("btn-tmode-delta");
-  if (ab) ab.classList.toggle("sel", mode !== "delta");
-  if (de) de.classList.toggle("sel", mode === "delta");
-}
-async function setTargetMode(mode) {
-  updateTargetModeUI(mode);
-  const out = await postJSON("/api/configure", { target_mode: mode });
-  setMsg(out.ok ? ("target_mode = " + mode)
-                : ("set target_mode failed: " + (out.message || "")));
 }
 
 // ---- IK / motion parameters (live: each change is applied immediately) ----
@@ -281,8 +259,6 @@ function initParams(s) {
 // auto-configure + enable, so Configure is just an explicit pre-configure.
 $("btn-configure").onclick = doConfigure;
 if ($("btn-snap-current")) $("btn-snap-current").onclick = doSnapCurrent;
-if ($("btn-tmode-absolute")) $("btn-tmode-absolute").onclick = () => setTargetMode("absolute");
-if ($("btn-tmode-delta")) $("btn-tmode-delta").onclick = () => setTargetMode("delta");
 
 // IK / motion parameter inputs: apply each one live on change.
 document.querySelectorAll("[data-key]").forEach((el) => {
