@@ -260,6 +260,10 @@ class CommanderDashboard(Node):
             Trigger, f"{self._ns}/return_to_start", callback_group=self._cbg)
         self._cli_snap = self.create_client(
             Trigger, f"{self._ns}/snap_target", callback_group=self._cbg)
+        # Optional teleop bridge reanchor (set_pose -> EE) so Snap recenters the
+        # source too; harmless if no bridge is running.
+        self._cli_reanchor = self.create_client(
+            Trigger, "/spacemouse_teleop/reanchor", callback_group=self._cbg)
 
         if _HAVE_TF:
             self._tf_buffer = tf2_ros.Buffer()
@@ -534,6 +538,29 @@ class CommanderDashboard(Node):
         return {"ok": True,
                 "message": "configure sent (%s)" % ", ".join(sorted(cfg))}
 
+    def set_link(self, control_link: str = "", frame_link: str = "") -> dict:
+        """Change control/base link via the unified PoseCommand (no pose).
+
+        The single channel for link changes: the commander applies it live
+        (disable -> reconfigure -> snap -> re-enable) so it works whether the
+        commander is enabled or not, jump-free. No legacy ``controlled_frame``
+        on ~/configure (which is refused while enabled).
+        """
+        if self._pc_pub is None:
+            return {"ok": False, "message": "PoseCommand unavailable"}
+        if not control_link and not frame_link:
+            return {"ok": False, "message": "no link given"}
+        c = PoseCommand()
+        c.header.stamp = self.get_clock().now().to_msg()
+        c.frame_link = str(frame_link or "")
+        c.control_link = str(control_link or "")
+        c.has_pose = False
+        for _ in range(3):
+            self._pc_pub.publish(c)
+            time.sleep(0.02)
+        return {"ok": True, "message": "link -> %s (base %s)"
+                % (control_link or "(keep)", frame_link or "(root)")}
+
     def call_trigger(self, enable: bool, timeout: float = 5.0) -> dict:
         cli = self._cli_enable if enable else self._cli_disable
         if not cli.wait_for_service(timeout_sec=timeout):
@@ -577,6 +604,20 @@ class CommanderDashboard(Node):
             return {"ok": False, "message": "snap_target timed out"}
         res = fut.result()
         return {"ok": bool(res.success), "message": res.message}
+
+    def call_reanchor(self, timeout: float = 2.0) -> dict:
+        """Reset the teleop source to the current EE (bridge ~/reanchor ->
+        set_pose) so a Snap also recenters the puck and the goal stays put.
+        No-op if no bridge is running."""
+        if not self._cli_reanchor.wait_for_service(timeout_sec=timeout):
+            return {"ok": False, "message": "no teleop bridge"}
+        fut = self._cli_reanchor.call_async(Trigger.Request())
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "reanchor timed out"}
+        r = fut.result()
+        return {"ok": bool(r.success), "message": r.message}
 
     def capture(self, timeout: float = 2.0
                 ) -> Tuple[Optional[list], Optional[list]]:
@@ -719,6 +760,10 @@ class CommanderDashboard(Node):
                 if path == "/api/configure":
                     return self._send(200, json.dumps(
                         dash.configure(self._read_json())))
+                if path == "/api/set_link":
+                    b = self._read_json()
+                    return self._send(200, json.dumps(dash.set_link(
+                        b.get("control_link", ""), b.get("frame_link", ""))))
                 if path == "/api/enable":
                     return self._send(200, json.dumps(dash.call_trigger(True)))
                 if path == "/api/disable":
@@ -729,6 +774,8 @@ class CommanderDashboard(Node):
                 if path == "/api/snap_target":
                     return self._send(200, json.dumps(
                         dash.call_snap_target()))
+                if path == "/api/reanchor":
+                    return self._send(200, json.dumps(dash.call_reanchor()))
                 if path == "/api/capture":
                     xyz, quat = dash.capture()
                     if xyz is None:

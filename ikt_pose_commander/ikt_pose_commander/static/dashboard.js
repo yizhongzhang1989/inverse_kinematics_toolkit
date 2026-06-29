@@ -149,17 +149,14 @@ async function onFixedToggle() {
 async function doConfigure() {
   const link = $("link-select").value;
   if (!link) { setMsg("pick a controlled link first"); return; }
-  const out = await postJSON("/api/configure",
-    { controlled_frame: link, base_frame: $("base-select").value,
-      fixed_joints: fixedJointsSelected() });
-  setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
+  // Link/base go through the single pose_command channel (live, jump-free; the
+  // commander snaps on the switch). Solver-only keys stay on /api/configure.
+  const out = await postJSON("/api/set_link",
+    { control_link: link, frame_link: $("base-select").value });
+  await postJSON("/api/configure", { fixed_joints: fixedJointsSelected() });
+  setMsg((out.ok ? "link: " : "link FAILED: ") + (out.message || ""));
   poll();
-  // Auto-snap the target onto the newly controlled link's CURRENT pose so the
-  // gizmo + commander goal start from where the arm is (no jump on engage).
-  if (out.ok) {
-    if (window.snapTargetToLink) window.snapTargetToLink();
-    await doSnapCurrent();
-  }
+  if (window.snapTargetToLink) window.snapTargetToLink();
 }
 
 // ---- Snap target -> current pose (server-side) ---------------------------
@@ -167,6 +164,7 @@ async function doConfigure() {
 // CURRENT pose (FK of the measured joints) — re-centres the goal with no jump.
 async function doSnapCurrent() {
   const out = await postJSON("/api/snap_target", {});
+  await postJSON("/api/reanchor", {});   // also recenter the puck so it sticks
   setMsg((out.ok ? "snapped: " : "snap failed: ") + (out.message || ""));
 }
 

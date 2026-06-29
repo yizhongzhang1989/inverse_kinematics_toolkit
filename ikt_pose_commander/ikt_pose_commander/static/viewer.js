@@ -396,7 +396,7 @@ async function engage(mode) {
   if (!link) { actionMsg("pick a controlled link first"); return false; }
   let snap = await api("/api/state");
   let s = snap && snap.status;
-  const needCfg = !s || !s.configured || s.controlled_frame !== link || s.mode !== mode;
+  const needCfg = !s || !s.configured || s.mode !== mode;
   if (needCfg) {
     if (s && s.enabled) await gizmoPost("/api/disable");
     const cfg = { controlled_frame: link, base_frame: base, command_mode: mode };
@@ -407,9 +407,11 @@ async function engage(mode) {
     for (let i = 0; i < 40; i++) {
       await sleep(100);
       snap = await api("/api/state"); s = snap && snap.status;
-      if (s && s.configured && s.mode === mode && s.controlled_frame === link) { ok = true; break; }
+      if (s && s.configured && s.mode === mode) { ok = true; break; }
     }
     if (!ok) { actionMsg("configure to " + mode + " failed: " + (s ? s.last_message : "")); return false; }
+  } else if (s.controlled_frame !== link) {
+    await gizmoPost("/api/set_link", { control_link: link, frame_link: base });
   }
   if (snap && snap.root_frame) rootFrame = snap.root_frame;
   if (!s.enabled) { const r = await gizmoPost("/api/enable"); if (!r.ok) { actionMsg("enable failed: " + (r.message || "")); return false; } }
@@ -466,7 +468,11 @@ if ($("btn-disable")) $("btn-disable").onclick = stopRobot;
 // "match" the target). Skipped while live-tracking so an active FPC stream isn't
 // yanked to a new pose mid-motion.
 if ($("link-select")) $("link-select").addEventListener("change", () => {
-  if (!readMode && !tracking && window.__lastLinkTf) snapTargetToLink();
+  // Single channel: tell the commander the new link (live, jump-free); it
+  // snaps to the current EE. Then align the gizmo. Works enabled or not.
+  const link = $("link-select").value, base = ($("base-select") && $("base-select").value) || "";
+  gizmoPost("/api/set_link", { control_link: link, frame_link: base });
+  if (window.__lastLinkTf) snapTargetToLink();
 });
 
 // ---- dashboard Read / Send mode ----------------------------------------
