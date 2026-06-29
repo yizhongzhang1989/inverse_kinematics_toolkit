@@ -41,6 +41,12 @@ class SolveParams:
     damping_min: float = 1e-6
     damping_max: float = 10.0
     joint_centering_weight: float = 1e-2
+    # joint_lock_weight: secondary null-space bias toward the SEED (current q),
+    # i.e. "keep q unchanged". 0 = off. Parallel to joint_centering_weight
+    # (bias toward rest_posture); both run in the null space, each independently
+    # weighted so either can be enabled/disabled. Useful to pin a redundant
+    # joint (it stays at its current value instead of drifting).
+    joint_lock_weight: float = 0.0
     step_scale: float = 1.0
     ls_max_steps: int = 20
     ls_shrink: float = 0.5
@@ -62,6 +68,7 @@ def solve(
     params: Optional[SolveParams] = None,
     rest_posture: Optional[np.ndarray] = None,
     centering_weights: Optional[np.ndarray] = None,
+    lock_weights: Optional[np.ndarray] = None,
     active_joints: Optional[Sequence[str]] = None,
     extra_tasks: Optional[Sequence[ExtraTask]] = None,
 ) -> Solution:
@@ -98,6 +105,12 @@ def solve(
         wq = np.full(nq, p.joint_centering_weight, dtype=float)
     else:
         wq = np.asarray(centering_weights, dtype=float).reshape(nq).copy()
+    # Lock weights: bias toward the SEED (current q) so q stays unchanged. Own
+    # weight, default params.joint_lock_weight on every joint (0 = disabled).
+    if lock_weights is None:
+        wl = np.full(nq, p.joint_lock_weight, dtype=float)
+    else:
+        wl = np.asarray(lock_weights, dtype=float).reshape(nq).copy()
 
     task_list = list(tasks)
     extra_list = list(extra_tasks or [])
@@ -176,14 +189,20 @@ def solve(
         dq_task = Hinv_Jt @ We                          # nq
 
         # Soft posture / rest bias projected into the task NULL SPACE so it can
-        # never degrade the task (requirement 3 "prefer 0", minimal-change).
+        # never degrade the task (requirement 3 "prefer 0", minimal-change). A
+        # parallel lock bias (q_seed - q) keeps q at its seed; both are summed
+        # with their own weights, so enabling joint_lock_weight pins redundant
+        # joints instead of letting them drift.
         dq_rest = (q_rest - q)
         dq_rest[~mask] = 0.0
+        dq_lock = (q_seed_arr - q)
+        dq_lock[~mask] = 0.0
+        bias = wq * dq_rest + wl * dq_lock
         if m_rows > 0:
             N = np.eye(nq) - Hinv_Jt @ WJ               # nq x nq null projector
-            dq_null = N @ (wq * dq_rest)
+            dq_null = N @ bias
         else:
-            dq_null = wq * dq_rest
+            dq_null = bias
         dq_task[~mask] = 0.0
         dq_null[~mask] = 0.0
 

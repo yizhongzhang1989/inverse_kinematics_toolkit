@@ -455,6 +455,9 @@ function setGizmoMode(mode) {
 if ($("gizmo-move")) $("gizmo-move").onclick = () => setGizmoMode("translate");
 if ($("gizmo-rotate")) $("gizmo-rotate").onclick = () => setGizmoMode("rotate");
 if ($("btn-snap-target")) $("btn-snap-target").onclick = snapTargetToLink;
+// Expose so the Configure button (dashboard.js) can snap the gizmo to the
+// newly controlled link right after configuring.
+window.snapTargetToLink = snapTargetToLink;
 if ($("btn-snap-robot")) $("btn-snap-robot").onclick = snapRobot;
 if ($("btn-track-robot")) $("btn-track-robot").onclick = trackRobot;
 if ($("btn-disable")) $("btn-disable").onclick = stopRobot;

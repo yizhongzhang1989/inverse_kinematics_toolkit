@@ -50,7 +50,8 @@ least-squares problem:
 $$
 \begin{aligned}
 \min_{q}\quad & \tfrac{1}{2}\sum_{k}\left\lVert W_{t,k}^{1/2}\,e_k(q)\right\rVert^{2}
-\;+\; \tfrac{1}{2}\left\lVert W_q^{1/2}\,(q - q_{\mathrm{rest}})\right\rVert^{2} \\
+\;+\; \tfrac{1}{2}\left\lVert W_q^{1/2}\,(q - q_{\mathrm{rest}})\right\rVert^{2}
+\;+\; \tfrac{1}{2}\left\lVert W_l^{1/2}\,(q - q_{\mathrm{seed}})\right\rVert^{2} \\
 \text{s.t.}\quad & q_{\min} \le q \le q_{\max}
 \end{aligned}
 $$
@@ -58,7 +59,10 @@ $$
 - $e_k(q)$ is the 6-DOF pose error (position + log-map orientation) of task $k$,
   evaluated on the Pinocchio model in the `LOCAL_WORLD_ALIGNED` frame.
 - $W_{t,k}$ is the per-DOF **task stiffness** (a zero weight drops that DOF — e.g.
-  position-only); $W_q$ is the **joint-centering / rest-posture** weight.
+  position-only); $W_q$ is the **joint-centering / rest-posture** weight (bias
+  toward $q_{\mathrm{rest}}$); $W_l$ is the **joint-lock** weight (keep $q$ at the
+  seed $q_{\mathrm{seed}}$). Each secondary term has its own weight, so either is
+  disabled by setting its weight to zero.
 
 Each iteration:
 
@@ -70,9 +74,9 @@ Each iteration:
    $(J^\top W J + \mu I)\,\Delta q_{\mathrm{task}} = J^\top W e$; the damping
    $\mu$ keeps the step finite through singularities.
 3. **Posture bias** is projected into the task **null space** —
-   $\Delta q_{\mathrm{null}} = \left(I - (J^\top W J + \mu I)^{-1} J^\top W J\right) W_q\,(q_{\mathrm{rest}} - q)$
-   — so joint centering pulls the redundant DOF toward $q_{\mathrm{rest}}$
-   without degrading the Cartesian task.
+   $\Delta q_{\mathrm{null}} = \left(I - (J^\top W J + \mu I)^{-1} J^\top W J\right)\left[W_q\,(q_{\mathrm{rest}} - q) + W_l\,(q_{\mathrm{seed}} - q)\right]$
+   — so centering pulls the redundant DOF toward $q_{\mathrm{rest}}$ and the lock
+   term holds it at the seed $q_{\mathrm{seed}}$, without degrading the task.
 4. **Box-projected backtracking line search:** the combined
    $\Delta q_{\mathrm{task}} + \Delta q_{\mathrm{null}}$ step is clipped to
    $[q_{\min}, q_{\max}]$ and accepted only if it lowers the task error;

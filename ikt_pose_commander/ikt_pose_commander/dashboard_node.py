@@ -45,6 +45,13 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
+
+try:
+    from ikt_interfaces.msg import PoseCommand
+    _HAS_POSE_CMD = True
+except Exception:  # noqa: BLE001  pragma: no cover
+    PoseCommand = None  # type: ignore
+    _HAS_POSE_CMD = False
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -233,6 +240,12 @@ class CommanderDashboard(Node):
                                  self._on_target, 10, callback_group=self._cbg)
         self._target_pub = self.create_publisher(
             PoseStamped, f"{self._ns}/target_pose", 10)
+        # Unified command channel: control the robot via one PoseCommand
+        # (frame_link + control_link + pose). The PoseStamped above is kept only
+        # so the 3D marker shows a live target; the command goes via PoseCommand.
+        self._pc_pub = self.create_publisher(
+            PoseCommand, f"{self._ns}/pose_command", 10) \
+            if _HAS_POSE_CMD else None
         if _RM_IMPORT_ERROR is not None:
             self.get_logger().warning(
                 "ikt_core.robot_model unavailable (%s) - 3D robot view "
@@ -508,6 +521,16 @@ class CommanderDashboard(Node):
         for _ in range(3):
             self._configure_pub.publish(m)
             time.sleep(0.02)
+        # Frame/control link also go through the unified PoseCommand topic so the
+        # dashboard drives the commander through the same interface as motion.
+        if self._pc_pub is not None and (cfg.get("controlled_frame")
+                                         or cfg.get("base_frame")):
+            c = PoseCommand()
+            c.header.stamp = self.get_clock().now().to_msg()
+            c.frame_link = str(cfg.get("base_frame") or "")
+            c.control_link = str(cfg.get("controlled_frame") or "")
+            c.has_pose = False
+            self._pc_pub.publish(c)
         return {"ok": True,
                 "message": "configure sent (%s)" % ", ".join(sorted(cfg))}
 
@@ -588,11 +611,25 @@ class CommanderDashboard(Node):
         m.pose.orientation.z = float(quat[3])
         return m
 
+    def _publish_command(self, xyz: list, quat: list, frame_id: str) -> None:
+        """Publish the unified PoseCommand: pose + the live frame_link/
+        control_link, so the commander has all three in one message."""
+        if self._pc_pub is None:
+            return
+        c = PoseCommand()
+        c.header.stamp = self.get_clock().now().to_msg()
+        c.frame_link = frame_id or self._base_frame
+        c.control_link = self._controlled_frame() or ""
+        c.has_pose = True
+        c.pose = self._build_target_msg(xyz, quat, frame_id).pose
+        self._pc_pub.publish(c)
+
     def send_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
         m = self._build_target_msg(xyz, quat, frame_id)
         # publish a few times so a just-matched subscriber surely receives it
         for _ in range(3):
-            self._target_pub.publish(m)
+            self._publish_command(xyz, quat, frame_id)   # the actual command
+            self._target_pub.publish(m)                  # marker visualisation
             time.sleep(0.02)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}
@@ -605,6 +642,7 @@ class CommanderDashboard(Node):
         be called at the gizmo drag rate; the next frame re-sends anyway.
         """
         m = self._build_target_msg(xyz, quat, frame_id)
+        self._publish_command(xyz, quat, frame_id)
         self._target_pub.publish(m)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}

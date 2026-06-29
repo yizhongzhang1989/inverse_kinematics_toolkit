@@ -238,6 +238,34 @@ ros2 topic pub /ikt_pose_commander/target_pose geometry_msgs/msg/PoseStamped \
     '{header: {frame_id: base_link}, pose: {position: {x: 0.6, y: 0.0, z: 0.6}, orientation: {w: 1.0}}}'
 ```
 
+## Unified command: `~/pose_command` (frame_link + control_link + pose)
+
+One message (`ikt_interfaces/PoseCommand`) carries all three pieces — the frame
+the pose is in, the link to control, and the target pose — so a single topic can
+both select the control link and command it:
+
+```
+string frame_link     # frame the pose is defined in ("" = reuse previous)
+string control_link   # link to control            ("" = reuse previous)
+bool   has_pose       # true -> pose is set this msg; false -> reuse previous
+geometry_msgs/Pose pose
+```
+
+Every field is **optional**: an empty `frame_link`/`control_link` or
+`has_pose:=false` reuses the last value. If a field is **never** set the default
+is the model's **first link** (`frame_link`, the root) and **last link**
+(`control_link`, the tip). `control_link` is applied live — sending a new one
+re-derives the joints/controllers and snaps to the current pose (no jump), even
+while enabled. This is what the dashboard now uses to drive the robot. The
+legacy `~/target_pose` + `~/configure` inputs remain for back-compat.
+
+```bash
+ros2 topic pub --once /ikt_pose_commander/pose_command ikt_interfaces/msg/PoseCommand \
+    '{frame_link: base_link, control_link: link_6, has_pose: true, \
+      pose: {position: {x: 0.6, y: 0.0, z: 0.6}, orientation: {w: 1.0}}}'
+```
+
+
 ## SpaceMouse teleop (via `spacemouse_teleop`)
 
 The commander stays **device-agnostic**: SpaceMouse teleop is fed through the

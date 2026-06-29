@@ -154,6 +154,12 @@ async function doConfigure() {
       fixed_joints: fixedJointsSelected() });
   setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
   poll();
+  // Auto-snap the target onto the newly controlled link's CURRENT pose so the
+  // gizmo + commander goal start from where the arm is (no jump on engage).
+  if (out.ok) {
+    if (window.snapTargetToLink) window.snapTargetToLink();
+    await doSnapCurrent();
+  }
 }
 
 // ---- Snap target -> current pose (server-side) ---------------------------

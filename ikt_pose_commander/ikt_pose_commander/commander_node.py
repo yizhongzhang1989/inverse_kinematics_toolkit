@@ -64,6 +64,16 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_CM = False
 
+# Unified pose command (frame_link + control_link + pose, all optional). The
+# node degrades gracefully (the ~/pose_command topic is just skipped) if the
+# interfaces package is not built/sourced.
+try:
+    from ikt_interfaces.msg import PoseCommand
+    _HAS_POSE_CMD = True
+except Exception:  # noqa: BLE001  pragma: no cover
+    PoseCommand = None  # type: ignore
+    _HAS_POSE_CMD = False
+
 # In-process IK (the advisory solver). Pure-Python core: no topic round-trip.
 try:
     from ikt_core.robot_model import RobotModel
@@ -101,6 +111,7 @@ _LIVE_KEYS = (
     "joint_states_stale_after", "joint_centering_weight", "damping",
     "tol_pos", "tol_ori", "max_iters", "default_stiffness",
     "allow_unreachable", "reach_gain",
+    "joint_lock_weight",
     "control_rate_hz",
     "singularity_decouple", "singularity_sigma", "singularity_exit_ratio",
     "joint_speed_limits", "joint_accel_limits",
@@ -133,6 +144,11 @@ class PoseCommander(Node):
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("target_pose_topic", "~/target_pose")
+        # Unified command topic (ikt_interfaces/PoseCommand): one message carries
+        # frame_link + control_link + pose, each optional (empty = reuse the
+        # previous). Defaults if never set: frame_link = first link (root),
+        # control_link = last link (tip).
+        self.declare_parameter("pose_command_topic", "~/pose_command")
         # base_frame: the frame a target with an EMPTY ``header.frame_id`` is
         # assumed to be expressed in. Every target is transformed into the model
         # root for the solver, so any TF frame works as a reference. Live /
@@ -178,6 +194,9 @@ class PoseCommander(Node):
         # for gradual, smoother stretching. 1.0 = full step (today's behaviour).
         self.declare_parameter("reach_gain", 1.0)
         self.declare_parameter("joint_centering_weight", 1e-2)
+        # joint_lock_weight: secondary null-space term that keeps q at the SEED
+        # (current pose) -- pins redundant joints so they don't drift. 0 = off.
+        self.declare_parameter("joint_lock_weight", 0.0)
         self.declare_parameter("damping", 1e-2)
         self.declare_parameter("tol_pos", 1e-3)
         self.declare_parameter("tol_ori", 3.5e-3)
@@ -255,6 +274,7 @@ class PoseCommander(Node):
         self._allow_unreachable = bool(gp("allow_unreachable").value)
         self._reach_gain = min(1.0, max(1e-3, float(gp("reach_gain").value)))
         self._centering = float(gp("joint_centering_weight").value)
+        self._lock_w = float(gp("joint_lock_weight").value)
         self._damping = float(gp("damping").value)
         self._tol_pos = float(gp("tol_pos").value)
         self._tol_ori = float(gp("tol_ori").value)
@@ -386,6 +406,11 @@ class PoseCommander(Node):
                                  self._on_target, 10, callback_group=cb)
         self.create_subscription(String, "~/configure",
                                  self._on_configure, 10, callback_group=cb)
+        # Unified frame_link/control_link/pose command.
+        if _HAS_POSE_CMD:
+            self.create_subscription(
+                PoseCommand, str(gp("pose_command_topic").value),
+                self._on_pose_command, 10, callback_group=cb)
         # Controller-dependent endpoints are (re)created on configure.
         self._fpc_pub = None
         self._jtc_client = None
@@ -617,6 +642,7 @@ class PoseCommander(Node):
                 ("max_step_rad", "_max_step", None),
                 ("joint_states_stale_after", "_js_stale", None),
                 ("joint_centering_weight", "_centering", None),
+                ("joint_lock_weight", "_lock_w", 0.0),
                 ("damping", "_damping", None),
                 ("tol_pos", "_tol_pos", None),
                 ("tol_ori", "_tol_ori", None),
@@ -1073,6 +1099,68 @@ class PoseCommander(Node):
     # ------------------------------------------------------------------ #
     # Main path: target -> solve -> gate -> command
     # ------------------------------------------------------------------ #
+    def _last_link_default(self) -> str:
+        """The model's LAST link — the control_link default when none was set."""
+        with self._lock:
+            model = self._model
+        if model is None:
+            return ""
+        names = model.link_frame_names()
+        return names[-1] if names else ""
+
+    def _on_pose_command(self, msg) -> None:
+        """Unified command: set frame_link / control_link / pose in one message.
+
+        Any field is optional. Empty ``frame_link`` / ``control_link`` reuse the
+        current value; a never-set control_link defaults to the last link and a
+        never-set frame_link to the model root (first link). ``has_pose`` gates
+        whether ``pose`` is a new target. control_link is applied live (disable ->
+        reconfigure -> snap -> re-enable) so it can change while driving.
+        """
+        frame_link = (msg.frame_link or "").strip()
+        control_link = (msg.control_link or "").strip()
+        with self._lock:
+            cur_frame = self._frame
+            configured = self._configured
+            enabled = self._enabled
+        cfg: dict = {}
+        if frame_link:
+            cfg["base_frame"] = frame_link
+        want = control_link or ("" if configured else self._last_link_default())
+        if want and want != cur_frame:
+            cfg["controlled_frame"] = want
+        if cfg:
+            if enabled and "controlled_frame" in cfg:
+                self._switch_control_link(cfg)
+            else:
+                ok, m = self._apply_config(cfg)
+                if not ok:
+                    self._set_msg("pose_command cfg ignored: " + m)
+        if getattr(msg, "has_pose", False):
+            ps = PoseStamped()
+            ps.header.frame_id = ""   # interpreted in base_frame (= frame_link)
+            ps.pose = msg.pose
+            self._on_target(ps)
+
+    def _switch_control_link(self, cfg: dict) -> None:
+        """Change control_link while ENABLED: hold, switch back to JTC, apply the
+        new group, snap the goal to the current pose (no jump), then re-enable."""
+        with self._lock:
+            self._enabled = False
+            mode, jtc, fpc = self._mode, self._jtc, self._fpc
+        if self._do_switch and mode == "fpc" and jtc and fpc:
+            self._switch(activate=[jtc], deactivate=[fpc])
+        ok, m = self._apply_config(cfg)
+        if not ok:
+            self._set_msg("control_link switch failed: " + m)
+            return
+        self._snap_target()
+        ok, m = self._try_enable()
+        if ok:
+            self._snap_target()
+        self._set_msg("control_link -> %s (live switch)"
+                      % cfg.get("controlled_frame"))
+
     def _on_target(self, msg: PoseStamped) -> None:
         with self._lock:
             self._last_target_stamp = time.monotonic()
@@ -1346,7 +1434,8 @@ class PoseCommander(Node):
         params = ik_core.SolveParams(
             max_iters=self._max_iters, tol_pos=self._tol_pos,
             tol_ori=self._tol_ori, damping=self._damping,
-            joint_centering_weight=self._centering)
+            joint_centering_weight=self._centering,
+            joint_lock_weight=self._lock_w)
         task = self._build_task(xyz, quat)
         with self._fk_lock:
             return ik_core.solve(model, seed, [task], params=params,
@@ -1903,6 +1992,7 @@ class PoseCommander(Node):
             "joint_states_stale_after": self._js_stale,
             "default_stiffness": list(self._stiffness),
             "joint_centering_weight": self._centering,
+            "joint_lock_weight": self._lock_w,
             "damping": self._damping,
             "tol_pos": self._tol_pos,
             "tol_ori": self._tol_ori,
