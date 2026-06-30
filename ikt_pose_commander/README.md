@@ -89,7 +89,7 @@ SpaceMouse jogging is fed via [`spacemouse_teleop`](../../../src/spacemouse_tele
 ros2 launch spacemouse spacemouse.launch.py integration_frame:=world dashboard_port:=8080
 ros2 launch ikt_pose_commander commander.launch.py controlled_frame:=compliance_link dashboard_port:=8180
 ros2 launch spacemouse_teleop spacemouse_teleop.launch.py
-# enable on :8180, then jog
+# on :8180 turn SpaceMouse → target ON (engages the commander), then jog
 ```
 
 ## Dashboard (optional)
@@ -108,8 +108,15 @@ the UI can never bypass reachability / jump / speed limits:
 
 * **Configure** — pick the controlled + base link, click Configure (while
   disabled). **Snap target → current pose** seeds the goal on the live pose.
-* **Engage** — *Snap robot (jtc)* one discrete move; *Track robot (fpc)* streams
-  the gizmo live; *Stop / Disengage* disables and holds.
+* **Mode** — *Read (monitor)* only displays the live commanded target (e.g. from
+  the SpaceMouse); *Send (control)* shows the gizmo so you can drive. The
+  **SpaceMouse → target** toggle hands `target_pose` to the puck: ON engages the
+  commander and streams the SpaceMouse bridge (this dashboard stays silent); OFF
+  lets the dashboard drive. The two sources are mutually exclusive.
+* **Target frame** — drag the 3D gizmo (move / rotate); **Snap target → link**
+  re-places it on the selected control link.
+* **Engage** — *Snap robot (jtc)* one discrete move; *Track robot (fpc)*
+  continuously streams the gizmo target; *Stop / Disengage* disables and holds.
 * **Parameters** — live-tune stiffness, speeds, singularity knobs, tolerances.
 
 Default port **8180**; for multiple arms run one per arm on distinct ports.
@@ -143,6 +150,7 @@ ros2 launch ikt_pose_commander commander.launch.py controlled_frame:=arm_tip \
 | sub | `~/configure` | `std_msgs/String` JSON config (links + tunables, live) |
 | sub | `/robot_description`, `/joint_states` | model + seed |
 | pub | `/<fpc>/commands` | `std_msgs/Float64MultiArray` (fpc) |
+| act | `/<jtc>/follow_joint_trajectory` | `control_msgs/FollowJointTrajectory` (jtc) |
 | pub | `~/status` | `std_msgs/String` JSON (state, joints, last solve, tunables) |
 | srv | `~/enable` `~/disable` `~/stop` `~/snap_target` `~/return_to_start` | `std_srvs/Trigger` |
 
@@ -150,7 +158,10 @@ ros2 launch ikt_pose_commander commander.launch.py controlled_frame:=arm_tip \
 
 Set at launch, by `ros2 param set <ns> <key>`, or `~/configure` JSON. **Live**
 keys apply anytime; **structural** keys (`controlled_frame`, `joints`,
-`fixed_joints`, `*_controller`, `command_mode`) need disable first.
+`fixed_joints`, `*_controller`, `command_mode`) need disable first — *except* a
+`controlled_frame` change sent via `~/configure`, which is applied **live and
+jump-free** even while enabled (hold → switch link → snap → re-engage).
+`base_frame` is a live key.
 
 Most-used: `controlled_frame`, `base_frame`, `command_mode`, `default_stiffness`
 (`[x y z rx ry rz]`; `0`=free, `1`=rigid), `max_joint_speed`, `max_joint_accel`,
