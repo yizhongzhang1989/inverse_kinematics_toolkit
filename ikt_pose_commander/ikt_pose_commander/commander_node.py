@@ -64,16 +64,6 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_CM = False
 
-# Unified pose command (frame_link + control_link + pose, all optional). The
-# node degrades gracefully (the ~/pose_command topic is just skipped) if the
-# interfaces package is not built/sourced.
-try:
-    from ikt_interfaces.msg import PoseCommand
-    _HAS_POSE_CMD = True
-except Exception:  # noqa: BLE001  pragma: no cover
-    PoseCommand = None  # type: ignore
-    _HAS_POSE_CMD = False
-
 # In-process IK (the advisory solver). Pure-Python core: no topic round-trip.
 try:
     from ikt_core.robot_model import RobotModel
@@ -144,11 +134,6 @@ class PoseCommander(Node):
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("target_pose_topic", "~/target_pose")
-        # Unified command topic (ikt_interfaces/PoseCommand): one message carries
-        # frame_link + control_link + pose, each optional (empty = reuse the
-        # previous). Defaults if never set: frame_link = first link (root),
-        # control_link = last link (tip).
-        self.declare_parameter("pose_command_topic", "~/pose_command")
         # base_frame: the frame a target with an EMPTY ``header.frame_id`` is
         # assumed to be expressed in. Every target is transformed into the model
         # root for the solver, so any TF frame works as a reference. Live /
@@ -406,11 +391,6 @@ class PoseCommander(Node):
                                  self._on_target, 10, callback_group=cb)
         self.create_subscription(String, "~/configure",
                                  self._on_configure, 10, callback_group=cb)
-        # Unified frame_link/control_link/pose command.
-        if _HAS_POSE_CMD:
-            self.create_subscription(
-                PoseCommand, str(gp("pose_command_topic").value),
-                self._on_pose_command, 10, callback_group=cb)
         # Controller-dependent endpoints are (re)created on configure.
         self._fpc_pub = None
         self._jtc_client = None
@@ -551,6 +531,18 @@ class PoseCommander(Node):
             return
         if not any(k in req for k in (_LIVE_KEYS + _STRUCTURAL_KEYS)):
             self._set_msg("configure ignored: no known config keys")
+            return
+        # A control-link change while ENABLED is applied LIVE and jump-free
+        # (hold -> back to JTC -> reconfigure -> snap -> re-enable) instead of
+        # being refused, so the link can be retargeted without disabling first.
+        # base_frame and any live tunables in the same request ride along.
+        with self._lock:
+            enabled = self._enabled
+            cur_frame = self._frame
+            have_model = self._model is not None
+        want_frame = str(req.get("controlled_frame") or "").strip()
+        if enabled and have_model and want_frame and want_frame != cur_frame:
+            self._switch_control_link(req)
             return
         # Live tunables apply immediately, even before a model exists.
         live = self._apply_live(req)
@@ -1099,49 +1091,6 @@ class PoseCommander(Node):
     # ------------------------------------------------------------------ #
     # Main path: target -> solve -> gate -> command
     # ------------------------------------------------------------------ #
-    def _last_link_default(self) -> str:
-        """The model's LAST link — the control_link default when none was set."""
-        with self._lock:
-            model = self._model
-        if model is None:
-            return ""
-        names = model.link_frame_names()
-        return names[-1] if names else ""
-
-    def _on_pose_command(self, msg) -> None:
-        """Unified command: set frame_link / control_link / pose in one message.
-
-        Any field is optional. Empty ``frame_link`` / ``control_link`` reuse the
-        current value; a never-set control_link defaults to the last link and a
-        never-set frame_link to the model root (first link). ``has_pose`` gates
-        whether ``pose`` is a new target. control_link is applied live (disable ->
-        reconfigure -> snap -> re-enable) so it can change while driving.
-        """
-        frame_link = (msg.frame_link or "").strip()
-        control_link = (msg.control_link or "").strip()
-        with self._lock:
-            cur_frame = self._frame
-            configured = self._configured
-            enabled = self._enabled
-        cfg: dict = {}
-        if frame_link:
-            cfg["base_frame"] = frame_link
-        want = control_link or ("" if configured else self._last_link_default())
-        if want and want != cur_frame:
-            cfg["controlled_frame"] = want
-        if cfg:
-            if enabled and "controlled_frame" in cfg:
-                self._switch_control_link(cfg)
-            else:
-                ok, m = self._apply_config(cfg)
-                if not ok:
-                    self._set_msg("pose_command cfg ignored: " + m)
-        if getattr(msg, "has_pose", False):
-            ps = PoseStamped()
-            ps.header.frame_id = ""   # interpreted in base_frame (= frame_link)
-            ps.pose = msg.pose
-            self._on_target(ps)
-
     def _switch_control_link(self, cfg: dict) -> None:
         """Change control_link while ENABLED: hold, switch back to JTC, apply the
         new group, snap the goal to the current pose (no jump), then re-enable."""

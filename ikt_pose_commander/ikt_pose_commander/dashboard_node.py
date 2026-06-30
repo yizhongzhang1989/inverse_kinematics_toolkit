@@ -45,21 +45,14 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped
-
-try:
-    from ikt_interfaces.msg import PoseCommand
-    _HAS_POSE_CMD = True
-except Exception:  # noqa: BLE001  pragma: no cover
-    PoseCommand = None  # type: ignore
-    _HAS_POSE_CMD = False
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy, qos_profile_sensor_data)
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_msgs.msg import Bool, String
+from std_srvs.srv import SetBool, Trigger
 
 try:
     import tf2_ros
@@ -201,6 +194,9 @@ class CommanderDashboard(Node):
         self.declare_parameter("status_stale_after", 2.0)
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
+        # Rate at which the dashboard republishes its latest target so it ALWAYS
+        # streams target_pose (like the SpaceMouse bridge), not only on change.
+        self.declare_parameter("stream_rate_hz", 100.0)
 
         self._port = int(self.get_parameter("port").value)
         self._ns = str(self.get_parameter("commander_ns").value).rstrip("/")
@@ -208,6 +204,7 @@ class CommanderDashboard(Node):
         self._stale = float(self.get_parameter("status_stale_after").value)
         self._desc_topic = str(self.get_parameter("robot_description_topic").value)
         self._js_topic = str(self.get_parameter("joint_states_topic").value)
+        self._stream_rate = float(self.get_parameter("stream_rate_hz").value)
         self._host = "0.0.0.0"
 
         self._cbg = ReentrantCallbackGroup()
@@ -226,6 +223,11 @@ class CommanderDashboard(Node):
         # live commanded target (from <ns>/target_pose or status; incl. pose_node)
         self._target: Optional[dict] = None
         self._target_stamp = 0.0
+        # Continuous target stream: republish the latest dashboard target at
+        # stream_rate_hz so it ALWAYS sends (mirrors the SpaceMouse bridge), not
+        # only on gizmo change. Active from a stream send until a disable.
+        self._stream_pose: Optional[Tuple[list, list, str]] = None
+        self._stream_active = False
 
         self.create_subscription(String, f"{self._ns}/status", self._on_status,
                                  10, callback_group=self._cbg)
@@ -240,12 +242,6 @@ class CommanderDashboard(Node):
                                  self._on_target, 10, callback_group=self._cbg)
         self._target_pub = self.create_publisher(
             PoseStamped, f"{self._ns}/target_pose", 10)
-        # Unified command channel: control the robot via one PoseCommand
-        # (frame_link + control_link + pose). The PoseStamped above is kept only
-        # so the 3D marker shows a live target; the command goes via PoseCommand.
-        self._pc_pub = self.create_publisher(
-            PoseCommand, f"{self._ns}/pose_command", 10) \
-            if _HAS_POSE_CMD else None
         if _RM_IMPORT_ERROR is not None:
             self.get_logger().warning(
                 "ikt_core.robot_model unavailable (%s) - 3D robot view "
@@ -264,6 +260,21 @@ class CommanderDashboard(Node):
         # source too; harmless if no bridge is running.
         self._cli_reanchor = self.create_client(
             Trigger, "/spacemouse_teleop/reanchor", callback_group=self._cbg)
+        # SpaceMouse forwarding gate: toggle whether the teleop bridge streams
+        # the puck pose to target_pose, so control can be handed between the
+        # SpaceMouse and this dashboard. The bridge latches ``forwarding``.
+        self._sm_forwarding: Optional[bool] = None
+        self._cli_set_forwarding = self.create_client(
+            SetBool, "/spacemouse_teleop/set_forwarding",
+            callback_group=self._cbg)
+        self.create_subscription(
+            Bool, "/spacemouse_teleop/forwarding", self._on_sm_forwarding,
+            _latched_qos(), callback_group=self._cbg)
+        # Continuous target streamer (always-send, like the bridge): the
+        # _stream_tick timer republishes the latest target at stream_rate_hz.
+        _srate = max(1.0, self._stream_rate)
+        self.create_timer(1.0 / _srate, self._stream_tick,
+                          callback_group=self._cbg)
 
         if _HAVE_TF:
             self._tf_buffer = tf2_ros.Buffer()
@@ -289,6 +300,15 @@ class CommanderDashboard(Node):
         with self._lock:
             self._status = s
             self._status_stamp = time.monotonic()
+
+    def _on_sm_forwarding(self, msg: Bool) -> None:
+        with self._lock:
+            fwd = bool(msg.data)
+            if fwd and not self._sm_forwarding:
+                # SpaceMouse just took over -> stop our own target stream so the
+                # two sources never both drive target_pose (double rate/conflict).
+                self._stream_active = False
+            self._sm_forwarding = fwd
 
     def _on_urdf(self, msg: String) -> None:
         if not msg.data or RobotModel is None:
@@ -460,6 +480,11 @@ class CommanderDashboard(Node):
                "age": round(age, 2) if age is not None else None,
                "commander_ns": self._ns, "base_frame": self._base_frame,
                "target": self._best_target(), "has_model_viz": model is not None}
+        with self._lock:
+            fwd = self._sm_forwarding
+        out["spacemouse"] = {
+            "bridge": self._cli_set_forwarding.service_is_ready(),
+            "forwarding": fwd}
         if model is not None:
             q = self._full_q(model)
             with self._fk_lock:
@@ -525,44 +550,14 @@ class CommanderDashboard(Node):
         for _ in range(3):
             self._configure_pub.publish(m)
             time.sleep(0.02)
-        # Frame/control link also go through the unified PoseCommand topic so the
-        # dashboard drives the commander through the same interface as motion.
-        if self._pc_pub is not None and (cfg.get("controlled_frame")
-                                         or cfg.get("base_frame")):
-            c = PoseCommand()
-            c.header.stamp = self.get_clock().now().to_msg()
-            c.frame_link = str(cfg.get("base_frame") or "")
-            c.control_link = str(cfg.get("controlled_frame") or "")
-            c.has_pose = False
-            self._pc_pub.publish(c)
         return {"ok": True,
                 "message": "configure sent (%s)" % ", ".join(sorted(cfg))}
 
-    def set_link(self, control_link: str = "", frame_link: str = "") -> dict:
-        """Change control/base link via the unified PoseCommand (no pose).
-
-        The single channel for link changes: the commander applies it live
-        (disable -> reconfigure -> snap -> re-enable) so it works whether the
-        commander is enabled or not, jump-free. No legacy ``controlled_frame``
-        on ~/configure (which is refused while enabled).
-        """
-        if self._pc_pub is None:
-            return {"ok": False, "message": "PoseCommand unavailable"}
-        if not control_link and not frame_link:
-            return {"ok": False, "message": "no link given"}
-        c = PoseCommand()
-        c.header.stamp = self.get_clock().now().to_msg()
-        c.frame_link = str(frame_link or "")
-        c.control_link = str(control_link or "")
-        c.has_pose = False
-        for _ in range(3):
-            self._pc_pub.publish(c)
-            time.sleep(0.02)
-        return {"ok": True, "message": "link -> %s (base %s)"
-                % (control_link or "(keep)", frame_link or "(root)")}
-
     def call_trigger(self, enable: bool, timeout: float = 5.0) -> dict:
         cli = self._cli_enable if enable else self._cli_disable
+        if not enable:
+            with self._lock:
+                self._stream_active = False   # stop the dashboard target stream
         if not cli.wait_for_service(timeout_sec=timeout):
             return {"ok": False, "message": "service unavailable "
                     "(is the commander running?)"}
@@ -619,6 +614,23 @@ class CommanderDashboard(Node):
         r = fut.result()
         return {"ok": bool(r.success), "message": r.message}
 
+    def call_set_forwarding(self, enable: bool, timeout: float = 2.0) -> dict:
+        """Toggle the teleop bridge's forwarding (~/set_forwarding, SetBool).
+
+        ON  = SpaceMouse drives target_pose; OFF = this dashboard does. Returns
+        a no-op message if no bridge is running."""
+        if not self._cli_set_forwarding.wait_for_service(timeout_sec=timeout):
+            return {"ok": False, "message": "no teleop bridge"}
+        req = SetBool.Request()
+        req.data = bool(enable)
+        fut = self._cli_set_forwarding.call_async(req)
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "set_forwarding timed out"}
+        r = fut.result()
+        return {"ok": bool(r.success), "message": r.message}
+
     def capture(self, timeout: float = 2.0
                 ) -> Tuple[Optional[list], Optional[list]]:
         """Look up the controlled frame's current pose in base_frame."""
@@ -652,41 +664,47 @@ class CommanderDashboard(Node):
         m.pose.orientation.z = float(quat[3])
         return m
 
-    def _publish_command(self, xyz: list, quat: list, frame_id: str) -> None:
-        """Publish the unified PoseCommand: pose + the live frame_link/
-        control_link, so the commander has all three in one message."""
-        if self._pc_pub is None:
-            return
-        c = PoseCommand()
-        c.header.stamp = self.get_clock().now().to_msg()
-        c.frame_link = frame_id or self._base_frame
-        c.control_link = self._controlled_frame() or ""
-        c.has_pose = True
-        c.pose = self._build_target_msg(xyz, quat, frame_id).pose
-        self._pc_pub.publish(c)
-
     def send_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
         m = self._build_target_msg(xyz, quat, frame_id)
         # publish a few times so a just-matched subscriber surely receives it
         for _ in range(3):
-            self._publish_command(xyz, quat, frame_id)   # the actual command
-            self._target_pub.publish(m)                  # marker visualisation
+            self._target_pub.publish(m)                  # target pose -> commander
             time.sleep(0.02)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}
 
     def stream_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
-        """Publish ONE target setpoint (fast path for live gizmo dragging).
+        """Publish a target setpoint AND keep streaming it.
 
-        Unlike ``send_pose`` (which repeats for delivery reliability on a
-        one-shot send), this publishes a single message with no sleep so it can
-        be called at the gizmo drag rate; the next frame re-sends anyway.
+        Publishes immediately, then stores it as the active stream target so the
+        ``_stream_tick`` timer keeps republishing at ``stream_rate_hz`` -- the
+        dashboard then ALWAYS sends target_pose (like the SpaceMouse bridge),
+        not only when the gizmo moves. Streaming stops on disable.
         """
         m = self._build_target_msg(xyz, quat, frame_id)
-        self._publish_command(xyz, quat, frame_id)
-        self._target_pub.publish(m)
+        with self._lock:
+            # While the SpaceMouse bridge is forwarding it OWNS target_pose, so
+            # ignore the dashboard target entirely (don't arm the stream) -- the
+            # two sources never both drive, and nothing stale resumes later.
+            active = not self._sm_forwarding
+            if active:
+                self._stream_pose = (list(xyz), list(quat), frame_id)
+                self._stream_active = True
+        if active:
+            self._target_pub.publish(m)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}
+
+    def _stream_tick(self) -> None:
+        with self._lock:
+            # Suppress while the SpaceMouse bridge is forwarding so the two
+            # sources never both publish target_pose (double rate + conflict).
+            active = self._stream_active and not self._sm_forwarding
+            sp = self._stream_pose
+        if not (active and sp):
+            return
+        xyz, quat, frame_id = sp
+        self._target_pub.publish(self._build_target_msg(xyz, quat, frame_id))
 
     def jog(self, axis: str, delta: float) -> dict:
         xyz, quat = self.capture()
@@ -760,10 +778,6 @@ class CommanderDashboard(Node):
                 if path == "/api/configure":
                     return self._send(200, json.dumps(
                         dash.configure(self._read_json())))
-                if path == "/api/set_link":
-                    b = self._read_json()
-                    return self._send(200, json.dumps(dash.set_link(
-                        b.get("control_link", ""), b.get("frame_link", ""))))
                 if path == "/api/enable":
                     return self._send(200, json.dumps(dash.call_trigger(True)))
                 if path == "/api/disable":
@@ -776,6 +790,10 @@ class CommanderDashboard(Node):
                         dash.call_snap_target()))
                 if path == "/api/reanchor":
                     return self._send(200, json.dumps(dash.call_reanchor()))
+                if path == "/api/spacemouse_forwarding":
+                    body = self._read_json()
+                    return self._send(200, json.dumps(
+                        dash.call_set_forwarding(bool(body.get("enabled")))))
                 if path == "/api/capture":
                     xyz, quat = dash.capture()
                     if xyz is None:

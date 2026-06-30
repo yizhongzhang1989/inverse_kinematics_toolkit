@@ -334,8 +334,6 @@ let readMode = true;         // dashboard mode: true = Read/monitor, false = Sen
 let controlledFrame = "";    // commander's current controlled_frame
 let rootFrame = "";          // model root frame name (target frame_id)
 let _proxyInit = false;      // target frame placed at least once
-let _lastStreamT = 0;
-const STREAM_MIN_MS = 40;    // throttle live FPC streaming to ~25 Hz
 
 gizmo.addEventListener("dragging-changed", (e) => {
   controls.enabled = !e.value;                 // don't orbit while dragging a handle
@@ -343,8 +341,7 @@ gizmo.addEventListener("dragging-changed", (e) => {
 });
 gizmo.addEventListener("objectChange", () => {
   if (readMode || !tracking) return;            // commands only in Send mode while tracking
-  const now = performance.now();
-  if (now - _lastStreamT >= STREAM_MIN_MS) { _lastStreamT = now; sendProxyTarget(true); }
+  sendProxyTarget(true);                        // publish EVERY gizmo pose (no drop)
 });
 
 function setProxyFromMat(m4) {
@@ -411,7 +408,7 @@ async function engage(mode) {
     }
     if (!ok) { actionMsg("configure to " + mode + " failed: " + (s ? s.last_message : "")); return false; }
   } else if (s.controlled_frame !== link) {
-    await gizmoPost("/api/set_link", { control_link: link, frame_link: base });
+    await gizmoPost("/api/configure", { controlled_frame: link, base_frame: base });
   }
   if (snap && snap.root_frame) rootFrame = snap.root_frame;
   if (!s.enabled) { const r = await gizmoPost("/api/enable"); if (!r.ok) { actionMsg("enable failed: " + (r.message || "")); return false; } }
@@ -468,10 +465,10 @@ if ($("btn-disable")) $("btn-disable").onclick = stopRobot;
 // "match" the target). Skipped while live-tracking so an active FPC stream isn't
 // yanked to a new pose mid-motion.
 if ($("link-select")) $("link-select").addEventListener("change", () => {
-  // Single channel: tell the commander the new link (live, jump-free); it
-  // snaps to the current EE. Then align the gizmo. Works enabled or not.
+  // Tell the commander the new link via /api/configure (live, jump-free while
+  // enabled); it snaps to the current EE. Then align the gizmo. Enabled or not.
   const link = $("link-select").value, base = ($("base-select") && $("base-select").value) || "";
-  gizmoPost("/api/set_link", { control_link: link, frame_link: base });
+  gizmoPost("/api/configure", { controlled_frame: link, base_frame: base });
   if (window.__lastLinkTf) snapTargetToLink();
 });
 

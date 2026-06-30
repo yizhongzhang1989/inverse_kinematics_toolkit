@@ -90,6 +90,11 @@
         <button id="btn-mode-send" type="button" class="btn sm">Send (control)</button>
       </div>
       <div class="vf-hint" id="mode-hint">Read: the target frame follows the live commanded target (e.g. from the SpaceMouse) — nothing is sent. Send: drag the frame to command the robot.</div>
+      <div class="row" id="sm-ctl-row">
+        <button id="btn-sm-toggle" type="button" class="btn sm">SpaceMouse → target: …</button>
+        <span class="pill" id="sm-state">bridge?</span>
+      </div>
+      <div class="vf-hint">SpaceMouse control <b>ON</b> = the puck streams to <code>target_pose</code>. Turn it <b>OFF</b> to drive from this dashboard (Send mode) without the puck fighting you.</div>
     </section>
 
     <!-- Target frame (the goal pose the controlled link will be driven to match) -->

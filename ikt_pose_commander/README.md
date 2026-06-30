@@ -46,13 +46,13 @@ ros2 topic pub --once /ikt_pose_commander/target_pose geometry_msgs/msg/PoseStam
 ros2 service call /ikt_pose_commander/disable std_srvs/srv/Trigger
 ```
 
-Configure + command in **one** message with `ikt_interfaces/PoseCommand` (empty
-`frame_link`/`control_link` reuse the last; bare pose controls the tip):
+Change the controlled / base link anytime with `~/configure` (applied **live and
+jump-free** even while enabled — the commander holds, switches the link, snaps to
+the current pose, and re-engages):
 
 ```bash
-ros2 topic pub --once /ikt_pose_commander/pose_command ikt_interfaces/msg/PoseCommand \
-    '{control_link: link_6, frame_link: base_link, has_pose: true,
-      pose: {position: {x: 0.45, y: 0.0, z: 0.6}, orientation: {w: 1.0}}}'
+ros2 topic pub --once /ikt_pose_commander/configure std_msgs/msg/String \
+    '{data: "{\"controlled_frame\": \"link_6\", \"base_frame\": \"base_link\"}"}'
 ```
 
 Pin a link at launch (skip step 2), or pin the controller if the match is
@@ -83,7 +83,7 @@ ros2 service call /ikt_pose_commander/snap_target std_srvs/srv/Trigger
 ```
 
 SpaceMouse jogging is fed via [`spacemouse_teleop`](../../../src/spacemouse_teleop)
-(translates `/spacemouse/curr_pose` → `~/pose_command`, anchored to the EE):
+(translates `/spacemouse/curr_pose` → `~/target_pose`, anchored to the EE):
 
 ```bash
 ros2 launch spacemouse spacemouse.launch.py integration_frame:=world dashboard_port:=8080
@@ -140,8 +140,7 @@ ros2 launch ikt_pose_commander commander.launch.py controlled_frame:=arm_tip \
 | | name | type |
 |---|---|---|
 | sub | `~/target_pose` | `geometry_msgs/PoseStamped` (any TF frame) |
-| sub | `~/pose_command` | `ikt_interfaces/PoseCommand` (link + frame + pose) |
-| sub | `~/configure` | `std_msgs/String` JSON config |
+| sub | `~/configure` | `std_msgs/String` JSON config (links + tunables, live) |
 | sub | `/robot_description`, `/joint_states` | model + seed |
 | pub | `/<fpc>/commands` | `std_msgs/Float64MultiArray` (fpc) |
 | pub | `~/status` | `std_msgs/String` JSON (state, joints, last solve, tunables) |

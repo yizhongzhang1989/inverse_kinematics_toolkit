@@ -29,7 +29,6 @@
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>ikt_core</exec_depend>
-  <exec_depend>ikt_interfaces</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>ros2launch</exec_depend>
 
