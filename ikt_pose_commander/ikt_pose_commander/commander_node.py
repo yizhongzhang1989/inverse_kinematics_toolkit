@@ -1923,6 +1923,11 @@ class PoseCommander(Node):
             "mode": mode,
             "controlled_frame": frame,
             "base_frame": self._base_frame or "(model root)",
+            # Concrete reference frame an empty-frame_id target resolves to, so
+            # the SpaceMouse bridge can anchor + stamp target_pose in the SAME
+            # frame the dashboard base-link selection chose (mirrors how tip
+            # follows controlled_frame).
+            "base_frame_resolved": self._base_frame or self._model_root(),
             "joints": joints,
             "fixed_joints": fixed_joints,
             "group_joints": group_joints,

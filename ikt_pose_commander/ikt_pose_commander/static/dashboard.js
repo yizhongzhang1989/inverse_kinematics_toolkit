@@ -301,6 +301,14 @@ function initParams(s) {
 // The control link is chosen ONLY in the panel; Snap/Track (viewer.js)
 // auto-configure + enable, so Configure is just an explicit pre-configure.
 $("btn-configure").onclick = doConfigure;
+// Changing the base (reference) link applies LIVE on its own -- base_frame is a
+// _LIVE_KEY, so send it ALONE (NOT bundled with the structural controlled_frame,
+// which would be refused while enabled). The commander relays base_frame_resolved
+// in its status so the SpaceMouse bridge re-anchors + stamps target_pose in it.
+if ($("base-select")) $("base-select").addEventListener("change", async () => {
+  const out = await postJSON("/api/configure", { base_frame: $("base-select").value });
+  setMsg((out.ok ? "base link: " : "base link FAILED: ") + (out.message || ""));
+});
 if ($("btn-snap-current")) $("btn-snap-current").onclick = doSnapCurrent;
 
 // SpaceMouse control toggle: hand target_pose between the puck and this
