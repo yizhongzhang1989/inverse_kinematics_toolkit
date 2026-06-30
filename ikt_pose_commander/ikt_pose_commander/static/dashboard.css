@@ -212,6 +212,10 @@ input, select {
 }
 .vf-section .muted { text-transform: none; letter-spacing: 0; }
 .vf-hint { margin-top: 8px; font-size: 10px; color: #6a7282; line-height: 1.35; }
+.vf-legend { display: flex; align-items: center; gap: 5px; margin-top: 5px; }
+.vf-legend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+  margin-right: 1px; }
+.vf-legend .sw:not(:first-child) { margin-left: 8px; }
 
 /* ---- joint bars (centre-line fill, per-joint color) ---- */
 .vf-joints { display: flex; flex-direction: column; gap: 3px; }

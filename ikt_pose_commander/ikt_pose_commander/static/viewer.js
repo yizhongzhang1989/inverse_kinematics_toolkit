@@ -17,6 +17,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 
 const $ = (id) => document.getElementById(id);
@@ -51,7 +52,8 @@ scene.add(new THREE.HemisphereLight(0xb0d4f1, 0x404040, 0.85));
 const d1 = new THREE.DirectionalLight(0xffffff, 1.2); d1.position.set(3, 5, 4); scene.add(d1);
 const d2 = new THREE.DirectionalLight(0xffffff, 0.4); d2.position.set(-2, 3, -1); scene.add(d2);
 const grid = new THREE.GridHelper(3, 30, 0x445, 0x334); grid.rotation.x = Math.PI / 2; scene.add(grid);
-scene.add(new THREE.AxesHelper(0.25));   // base-frame triad at the origin
+const BASE_AXES_LEN = 0.25;
+scene.add(new THREE.AxesHelper(BASE_AXES_LEN));   // base-frame triad at the origin
 
 // ---- target marker (sphere + triad), driven by the live target ----------
 const targetGroup = new THREE.Group();
@@ -65,8 +67,11 @@ const solidMat = new THREE.MeshStandardMaterial({ color: 0x9fb4c4, metalness: 0.
 const highlightMat = new THREE.MeshStandardMaterial({ color: 0xffb454, emissive: 0x6e3d00,
   emissiveIntensity: 0.6, metalness: 0.2, roughness: 0.5 });
 const stlLoader = new STLLoader();
-const geomCache = {};   // url -> {geom, waiting:[cb]}
-const meshItems = {};   // key(link#i) -> {link, local, solid}
+const colladaLoader = new ColladaLoader();
+// url -> {kind:"stl"|"dae", obj, ready, waiting:[cb]}; obj = BufferGeometry (STL)
+// or the loaded COLLADA scene Group (DAE). Loaded once per url, cloned per use.
+const protoCache = {};
+const meshItems = {};   // key(link#i) -> {link, local, solid, kind}
 const frameAxes = {};   // link -> AxesHelper
 const labelPool = [];   // reusable label divs (clustered, not per-link)
 const fixedLabelPool = []; // reusable divs for the "FIXED" joint markers
@@ -95,17 +100,32 @@ function setSelected(link) {
   if ($("sel-link")) $("sel-link").textContent = selectedLink || "\u2014";
 }
 
-function getGeom(url, cb) {
-  const c = geomCache[url];
-  if (c && c.geom) { cb(c.geom); return; }
+// Mesh format is taken from the file extension. Direct URLs end in the ext
+// (.stl); the server's /mesh proxy carries it in a `path=` query param
+// (e.g. /mesh?pkg=ur_description&path=meshes/ur15/visual/base.dae).
+function meshExt(url) {
+  const m = /[?&]path=([^&]+)/.exec(url);
+  const p = m ? decodeURIComponent(m[1]) : url.split("?")[0];
+  const dot = p.lastIndexOf(".");
+  return dot >= 0 ? p.slice(dot + 1).toLowerCase() : "";
+}
+// Load a mesh url once (STL -> BufferGeometry, COLLADA -> scene Group) and cache
+// it; callers clone/instantiate per link. cb receives the cache entry.
+function loadProto(url, cb) {
+  const c = protoCache[url];
+  if (c && c.ready) { cb(c); return; }
   if (c) { c.waiting.push(cb); return; }
-  geomCache[url] = { geom: null, waiting: [cb] };
-  stlLoader.load(url, (g) => {
-    g.computeVertexNormals();
-    geomCache[url].geom = g;
-    geomCache[url].waiting.forEach((f) => f(g));
-    geomCache[url].waiting = [];
-  }, undefined, () => { /* load error: skeleton still shows */ });
+  const entry = protoCache[url] = { kind: meshExt(url), obj: null, ready: false, waiting: [cb] };
+  const done = (obj) => {
+    entry.obj = obj; entry.ready = true;
+    entry.waiting.forEach((f) => f(entry)); entry.waiting = [];
+  };
+  const fail = () => { entry.waiting = []; };   // load error: skeleton still shows
+  if (entry.kind === "dae") {
+    colladaLoader.load(url, (collada) => done(collada.scene), undefined, fail);
+  } else {
+    stlLoader.load(url, (g) => { g.computeVertexNormals(); done(g); }, undefined, fail);
+  }
 }
 function localMatrix(xyz, rpy, scale) {
   const m = new THREE.Matrix4();
@@ -123,12 +143,28 @@ function ensureMeshes(visuals) {
   visuals.forEach((v, i) => {
     const key = v.link + "#" + i;
     if (meshItems[key] !== undefined) return;
-    const item = { link: v.link, local: localMatrix(v.xyz, v.rpy, v.scale), solid: null };
+    const item = { link: v.link, local: localMatrix(v.xyz, v.rpy, v.scale), solid: null, kind: null };
     meshItems[key] = item;
-    getGeom(v.url, (geom) => {
-      const s = new THREE.Mesh(geom, solidMat); s.matrixAutoUpdate = false;
-      s.userData.link = v.link;          // for raycast → link lookup
-      item.solid = s; scene.add(s);
+    loadProto(v.url, (entry) => {
+      let obj;
+      if (entry.kind === "dae") {
+        // ColladaLoader rotates a Z_UP asset by -90deg about X to fit three's
+        // Y-up world (vertices are NOT converted). Our scene is ROS Z-up (we
+        // place link_tf directly) and the UR .dae vertices are authored Z-up to
+        // match the link frame, so we UNDO that up-axis tilt (keeping the unit
+        // scale) and place the clone via rosMat*local exactly like an STL.
+        // Without this every link is tipped 90deg and the arm looks disconnected.
+        const inner = entry.obj.clone(true);
+        inner.rotation.set(0, 0, 0);          // remove the Z_UP -> Y_UP tilt
+        inner.updateMatrix();
+        inner.traverse((o) => { if (o.isMesh) o.userData.link = v.link; });
+        obj = new THREE.Group(); obj.add(inner);
+      } else {
+        obj = new THREE.Mesh(entry.obj, solidMat);
+      }
+      obj.matrixAutoUpdate = false;
+      obj.userData.link = v.link;          // for raycast → link lookup
+      item.kind = entry.kind; item.solid = obj; scene.add(obj);
     });
   });
 }
@@ -138,7 +174,11 @@ function placeCurrent(linkTf) {
     const lm = linkTf[it.link];
     if (!lm || !opt.mesh) { it.solid.visible = false; continue; }
     it.solid.visible = true;
-    it.solid.material = (it.link === selectedLink) ? highlightMat : solidMat;
+    // STL meshes get the solid/highlight material swap; COLLADA keeps its own
+    // materials (the selected link is flagged by the wide highlight frame).
+    if (it.kind !== "dae") {
+      it.solid.material = (it.link === selectedLink) ? highlightMat : solidMat;
+    }
     it.solid.matrix.copy(rosMat(lm).multiply(it.local));
   }
 }
@@ -158,6 +198,55 @@ function placeFrames(linkTf) {
     if (!lm || !opt.frames) { ax.visible = false; continue; }
     ax.visible = true; ax.matrix.copy(rosMat(lm));
   }
+}
+
+// ---- highlight frames for the selected control + base links --------------
+// The selected control link and the base (reference) link each get a WIDE
+// coordinate triad. It is built from solid cylinders rather than a plain
+// THREE.AxesHelper because line width is ignored on most GPUs, so the axes
+// read as thick 3D bars that stand out clearly from the thin per-link frames.
+// Always shown (independent of the "frames" toggle) since these are the two
+// links the operator is actively configuring. A colored origin ball tags each:
+// amber = control link (matches the orange mesh highlight), cyan = base link.
+function makeFatAxes(len, rad, ballColor) {
+  const g = new THREE.Group();
+  g.matrixAutoUpdate = false; g.visible = false;
+  const shaft = (color, axis) => {
+    const geom = new THREE.CylinderGeometry(rad, rad, len, 16);
+    geom.translate(0, len / 2, 0);                 // base at origin, tip at +len
+    const m = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color }));
+    if (axis === "x") m.rotation.z = -Math.PI / 2;     // default +Y -> +X
+    else if (axis === "z") m.rotation.x = Math.PI / 2; // default +Y -> +Z
+    return m;                                          // axis === "y": as-is
+  };
+  g.add(shaft(0xff3b30, "x"));   // X red
+  g.add(shaft(0x34c759, "y"));   // Y green
+  g.add(shaft(0x2e7bff, "z"));   // Z blue
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(rad * 2.4, 16, 16),
+    new THREE.MeshBasicMaterial({ color: ballColor })));
+  return g;
+}
+// Highlight triads are kept SHORTER than the base/origin triad (BASE_AXES_LEN)
+// so they flag the selected links without dominating the view. Tune here.
+const HIGHLIGHT_AXES_LEN = 0.10;
+const ctrlHighlight = makeFatAxes(HIGHLIGHT_AXES_LEN, 0.008, 0xffb454);   // selected control link
+const baseHighlight = makeFatAxes(HIGHLIGHT_AXES_LEN, 0.007, 0x26c6da);   // base / reference link
+scene.add(ctrlHighlight); scene.add(baseHighlight);
+
+// Place the two highlight triads on their links' current poses. The control
+// link follows the panel selection; the base link follows the base-select
+// dropdown, falling back to the model root when "(robot root)" is chosen.
+function placeHighlights(linkTf) {
+  const ctrlLink = selectedLink || controlledFrame;
+  const cm = ctrlLink && linkTf[ctrlLink];
+  if (cm) { ctrlHighlight.visible = true; ctrlHighlight.matrix.copy(rosMat(cm)); }
+  else ctrlHighlight.visible = false;
+
+  const bsel = $("base-select");
+  const baseLink = (bsel && bsel.value) || rootFrame;
+  const bm = baseLink && linkTf[baseLink];
+  if (bm) { baseHighlight.visible = true; baseHighlight.matrix.copy(rosMat(bm)); }
+  else baseHighlight.visible = false;
 }
 
 // ---- per-link name labels (HTML overlay, clustered) ---------------------
@@ -468,8 +557,13 @@ if ($("link-select")) $("link-select").addEventListener("change", () => {
   // Tell the commander the new link via /api/configure (live, jump-free while
   // enabled); it snaps to the current EE. Then align the gizmo. Enabled or not.
   const link = $("link-select").value, base = ($("base-select") && $("base-select").value) || "";
+  setSelected(link);                       // highlight the new control link at once
   gizmoPost("/api/configure", { controlled_frame: link, base_frame: base });
-  if (window.__lastLinkTf) snapTargetToLink();
+  if (window.__lastLinkTf) { snapTargetToLink(); placeHighlights(window.__lastLinkTf); }
+});
+// Re-place the base highlight as soon as the base (reference) link changes.
+if ($("base-select")) $("base-select").addEventListener("change", () => {
+  if (window.__lastLinkTf) placeHighlights(window.__lastLinkTf);
 });
 
 // ---- dashboard Read / Send mode ----------------------------------------
@@ -605,7 +699,7 @@ function updateTcp(linkTf, frame) {
 function refreshStatic() {
   const tf = window.__lastLinkTf;
   if (!tf) return;
-  placeCurrent(tf); placeFrames(tf); placeLabels(tf);
+  placeCurrent(tf); placeFrames(tf); placeLabels(tf); placeHighlights(tf);
   updateSkeleton(tf, !opt.mesh || !window.__hasMeshes);
 }
 
@@ -628,6 +722,7 @@ async function poll() {
     if (s.has_meshes) ensureMeshes(s.visuals || []);
     ensureFrames(tf);
     placeCurrent(tf); placeFrames(tf); placeLabels(tf); placeFixedLabels(tf);
+    placeHighlights(tf);
     updateSkeleton(tf, !opt.mesh || !s.has_meshes);
     fitView(tf);
     window.__lastLinkTf = tf;
