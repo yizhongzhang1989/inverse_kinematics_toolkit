@@ -754,12 +754,20 @@ class CommanderDashboard(Node):
                     return self._send(200, json.dumps(dash.snapshot()))
                 if path == "/mesh":
                     q = parse_qs(urlparse(self.path).query)
-                    data = dash.read_mesh((q.get("pkg") or [""])[0],
-                                          (q.get("path") or [""])[0])
+                    rel = (q.get("path") or [""])[0]
+                    data = dash.read_mesh((q.get("pkg") or [""])[0], rel)
                     if data is None:
                         return self._send(404, b'{"error":"mesh not found"}')
+                    low = rel.lower()
+                    if low.endswith(".dae"):
+                        ctype = "model/vnd.collada+xml"
+                    elif low.endswith(".stl"):
+                        ctype = "model/stl"
+                    else:
+                        ctype = (mimetypes.guess_type(low)[0]
+                                 or "application/octet-stream")
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Cache-Control", "public, max-age=86400")
                     self.send_header("Access-Control-Allow-Origin", "*")

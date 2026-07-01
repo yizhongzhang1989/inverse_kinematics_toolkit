@@ -2,6 +2,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 
 const $ = (id) => document.getElementById(id);
 const DEG = Math.PI / 180;
@@ -48,21 +49,33 @@ const ghostMat = new THREE.MeshStandardMaterial({ color: 0x2f81f7, transparent: 
   metalness: 0.0, roughness: 0.9, depthWrite: false });
 
 const stlLoader = new STLLoader();
-const geomCache = {};   // url -> {geom, waiting:[cb]}  (load each STL once)
+const colladaLoader = new ColladaLoader();
+// url -> {kind:"stl"|"dae", obj, ready, waiting:[cb]}; obj = STL BufferGeometry
+// or the loaded COLLADA scene Group. Loaded once per url, cloned per use.
+const protoCache = {};
 const meshItems = {};   // key(link#i) -> {link, local, solid, ghost}
 let didFit = false;
 
-function getGeom(url, cb) {
-  const c = geomCache[url];
-  if (c && c.geom) { cb(c.geom); return; }
+// Mesh format from the file extension (direct .stl URLs, or the /mesh proxy's
+// ?path= query for .dae). STL -> BufferGeometry, COLLADA -> scene Group.
+function meshExt(url) {
+  const m = /[?&]path=([^&]+)/.exec(url);
+  const p = m ? decodeURIComponent(m[1]) : url.split("?")[0];
+  const dot = p.lastIndexOf(".");
+  return dot >= 0 ? p.slice(dot + 1).toLowerCase() : "";
+}
+function loadProto(url, cb) {
+  const c = protoCache[url];
+  if (c && c.ready) { cb(c); return; }
   if (c) { c.waiting.push(cb); return; }
-  geomCache[url] = { geom: null, waiting: [cb] };
-  stlLoader.load(url, (g) => {
-    g.computeVertexNormals();
-    geomCache[url].geom = g;
-    geomCache[url].waiting.forEach((f) => f(g));
-    geomCache[url].waiting = [];
-  }, undefined, () => { /* load error: skeleton still shows */ });
+  const entry = protoCache[url] = { kind: meshExt(url), obj: null, ready: false, waiting: [cb] };
+  const done = (obj) => { entry.obj = obj; entry.ready = true; entry.waiting.forEach((f) => f(entry)); entry.waiting = []; };
+  const fail = () => { entry.waiting = []; };   // load error: skeleton still shows
+  if (entry.kind === "dae") {
+    colladaLoader.load(url, (collada) => done(collada.scene), undefined, fail);
+  } else {
+    stlLoader.load(url, (g) => { g.computeVertexNormals(); done(g); }, undefined, fail);
+  }
 }
 
 function localMatrix(xyz, rpy, scale) {
@@ -78,18 +91,88 @@ function rosMat(a) {
     a[2][0], a[2][1], a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3]);
 }
 
+// ---- pose smoothing + on-demand rendering (ported from robot_test_dashboard)
+// Each poll sets a TARGET pose; the render loop eases the DISPLAYED robot toward
+// it every frame (pos lerp + quat slerp) so motion is smooth, and only draws
+// when something changed (robot easing, camera moving, or invalidate()), so an
+// idle canvas is nearly free. The IK logic keeps using the TRUE pose
+// (window.__lastLinkTf); only the on-screen robot is smoothed.
+const SMOOTH_TAU = 0.06, POS_EPS = 1e-4, ANG_EPS = 5e-4;
+const _ONE = new THREE.Vector3(1, 1, 1);
+const _dm = new THREE.Matrix4(), _cm = new THREE.Matrix4(), _hm = new THREE.Matrix4();
+const _dp = new THREE.Vector3(), _dq = new THREE.Quaternion(), _dsc = new THREE.Vector3();
+let targetPose = {};
+const dispPose = {}, dispTf = {};
+let needsRender = true;
+function invalidate() { needsRender = true; }
+THREE.DefaultLoadingManager.onLoad = invalidate;   // redraw once a mesh finished loading
+function rosMatInto(m, a) {
+  return m.set(
+    a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3],
+    a[2][0], a[2][1], a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3]);
+}
+function writeDispArray(link, pos, quat) {
+  _cm.compose(pos, quat, _ONE);
+  const e = _cm.elements;
+  let a = dispTf[link];
+  if (!a) a = dispTf[link] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]];
+  a[0][0] = e[0]; a[0][1] = e[4]; a[0][2] = e[8];  a[0][3] = e[12];
+  a[1][0] = e[1]; a[1][1] = e[5]; a[1][2] = e[9];  a[1][3] = e[13];
+  a[2][0] = e[2]; a[2][1] = e[6]; a[2][2] = e[10]; a[2][3] = e[14];
+}
+function setTargetPose(linkTf) {
+  const next = {}; let changed = false;
+  for (const link in (linkTf || {})) {
+    rosMatInto(_dm, linkTf[link]); _dm.decompose(_dp, _dq, _dsc);
+    next[link] = { pos: _dp.clone(), quat: _dq.clone() };
+    if (!dispPose[link]) { dispPose[link] = { pos: _dp.clone(), quat: _dq.clone() }; writeDispArray(link, _dp, _dq); changed = true; }
+  }
+  for (const link in dispPose) if (!next[link]) { delete dispPose[link]; delete dispTf[link]; changed = true; }
+  targetPose = next;
+  if (changed) invalidate();
+}
+function advanceInterp(dt) {
+  const alpha = 1 - Math.exp(-dt / SMOOTH_TAU); let moving = false;
+  for (const link in targetPose) {
+    const t = targetPose[link];
+    let d = dispPose[link] || (dispPose[link] = { pos: t.pos.clone(), quat: t.quat.clone() });
+    if (d.pos.distanceTo(t.pos) < POS_EPS && d.quat.angleTo(t.quat) < ANG_EPS) continue;
+    d.pos.lerp(t.pos, alpha); d.quat.slerp(t.quat, alpha);
+    writeDispArray(link, d.pos, d.quat); moving = true;
+  }
+  return moving;
+}
+function placeGeometry(tf) { placeCurrent(tf); updateSkeleton(tf); }
+
 function ensureMeshes(visuals) {
   visuals.forEach((v, i) => {
     const key = v.link + "#" + i;
     if (meshItems[key] !== undefined) return;
     const item = { link: v.link, local: localMatrix(v.xyz, v.rpy, v.scale), solid: null, ghost: null };
     meshItems[key] = item;
-    // each visual gets its OWN mesh instances (two arms share STL files, so we
-    // must NOT key by url — only the geometry is cached/reused per url).
-    getGeom(v.url, (geom) => {
-      const s = new THREE.Mesh(geom, solidMat); s.castShadow = true; s.matrixAutoUpdate = false;
-      const g = new THREE.Mesh(geom, ghostMat); g.matrixAutoUpdate = false; g.visible = false; g.renderOrder = 2;
-      item.solid = s; item.ghost = g; scene.add(s); scene.add(g);
+    // each visual gets its OWN mesh instances (two arms share files, so we must
+    // NOT key by url — only the proto geometry is cached/reused per url).
+    loadProto(v.url, (entry) => {
+      let solid, ghost;
+      if (entry.kind === "dae") {
+        // undo ColladaLoader's Z_UP->Y_UP tilt; the SOLID keeps native COLLADA
+        // materials, the GHOST is a translucent-blue clone of the same geometry.
+        const mk = (mat, shadow) => {
+          const inner = entry.obj.clone(true);
+          inner.rotation.set(0, 0, 0); inner.updateMatrix();
+          inner.traverse((o) => { if (o.isMesh) { if (mat) o.material = mat; if (shadow) o.castShadow = true; } });
+          const grp = new THREE.Group(); grp.add(inner); grp.matrixAutoUpdate = false;
+          return grp;
+        };
+        solid = mk(null, true);
+        ghost = mk(ghostMat, false);
+      } else {
+        solid = new THREE.Mesh(entry.obj, solidMat); solid.castShadow = true; solid.matrixAutoUpdate = false;
+        ghost = new THREE.Mesh(entry.obj, ghostMat); ghost.matrixAutoUpdate = false;
+      }
+      ghost.visible = false; ghost.renderOrder = 2;
+      item.solid = solid; item.ghost = ghost; scene.add(solid); scene.add(ghost);
+      invalidate();
     });
   });
 }
@@ -97,12 +180,13 @@ function placeCurrent(linkTf) {
   for (const key in meshItems) {
     const it = meshItems[key]; if (!it.solid) continue;
     const lm = linkTf[it.link];
-    if (!lm) { it.solid.visible = false; continue; }
+    if (!lm) { if (it.solid.visible) it.solid.visible = false; continue; }
     it.solid.visible = true;
-    it.solid.matrix.copy(rosMat(lm).multiply(it.local));
+    it.solid.matrix.multiplyMatrices(rosMatInto(_hm, lm), it.local);
   }
 }
 function placeGhost(linkTf) {
+  invalidate();
   const show = !!linkTf && $("ghost").checked;
   for (const key in meshItems) {
     const it = meshItems[key]; if (!it.ghost) continue;
@@ -110,7 +194,7 @@ function placeGhost(linkTf) {
     const lm = linkTf[it.link];
     if (!lm) { it.ghost.visible = false; continue; }
     it.ghost.visible = true;
-    it.ghost.matrix.copy(rosMat(lm).multiply(it.local));
+    it.ghost.matrix.multiplyMatrices(rosMatInto(_hm, lm), it.local);
   }
 }
 
@@ -143,6 +227,7 @@ function resetView(linkTf) {
   const sz = box.getSize(new THREE.Vector3()).length() || 1.0;
   controls.target.copy(c);
   camera.position.set(c.x + sz, c.y - sz, c.z + sz * 0.7); controls.update();
+  invalidate();
 }
 function fitView(linkTf) {
   if (didFit) return;
@@ -153,6 +238,7 @@ function fitView(linkTf) {
 
 // ---- target marker ------------------------------------------------------
 function updateTargetMarker() {
+  invalidate();
   if (!$("liveMarker").checked) { targetGroup.visible = false; return; }
   const x = +$("tx").value, y = +$("ty").value, z = +$("tz").value;
   if ([x, y, z].some(Number.isNaN)) { targetGroup.visible = false; return; }
@@ -275,8 +361,8 @@ async function poll() {
   $("modelInfo").textContent = `${(s.joints || []).length} DOF · ${(s.links || []).length} links · ` +
     (s.has_meshes ? `${s.visuals.length} meshes` : "skeleton");
   fillDropdowns(s);
-  if (s.has_meshes) { ensureMeshes(s.visuals); placeCurrent(s.link_tf); }
-  else updateSkeleton(s.link_tf);
+  if (s.has_meshes) ensureMeshes(s.visuals);
+  setTargetPose(s.link_tf);   // feed the smoother; the render loop eases + places it
   fitView(s.link_tf);
   // arm-angle readout from ik status
   const st = s.ik_status || {};
@@ -385,9 +471,12 @@ document.querySelectorAll("[data-preset]").forEach((b) => b.onclick = () => appl
 ["tx", "ty", "tz", "rr", "rp", "ryaw", "liveMarker"].forEach((id) => $(id).addEventListener("input", updateTargetMarker));
 
 poll(); setInterval(poll, 300);
-// Drive sizing from the actual canvas box each frame: robust to window resizes
-// and panel layout, and avoids the canvas intrinsic-size feedback loop.
-function resizeToDisplay() {
+// On-demand render loop: ease the displayed robot toward the polled pose and
+// only draw when it moved, the camera moved, or invalidate() was called. Resize
+// via ResizeObserver (not a per-frame layout read).
+let _pendingResize = true;
+function applyResize() {
+  _pendingResize = false;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h) return;
   const pr = renderer.getPixelRatio();
@@ -396,4 +485,18 @@ function resizeToDisplay() {
     camera.aspect = w / h; camera.updateProjectionMatrix();
   }
 }
-(function animate() { requestAnimationFrame(animate); resizeToDisplay(); controls.update(); renderer.render(scene, camera); })();
+new ResizeObserver(() => { _pendingResize = true; invalidate(); }).observe(canvas);
+let _prevT = performance.now();
+(function animate(now) {
+  requestAnimationFrame(animate);
+  const t = now || performance.now();
+  const dt = Math.min(0.1, Math.max(0, (t - _prevT) * 0.001)); _prevT = t;
+  if (_pendingResize) applyResize();
+  const moving = advanceInterp(dt);
+  const camMoved = controls.update();
+  if (moving || needsRender || camMoved) {
+    if (moving || needsRender) placeGeometry(dispTf);
+    renderer.render(scene, camera);
+    needsRender = false;
+  }
+})();
