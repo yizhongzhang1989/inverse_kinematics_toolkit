@@ -19,6 +19,44 @@ function setMsg(text) {
   $("action-msg").textContent = text || "";
 }
 
+// ---- SpaceMouse control toggle (teleop bridge forwarding) -----------------
+// ON  = the SpaceMouse bridge streams the puck pose to target_pose.
+// OFF = the bridge stays silent so THIS dashboard (Send mode) owns target_pose.
+let smForwarding = null;   // null = no bridge / unknown
+function updateSpacemouse(sm, enabled) {
+  const btn = $("btn-sm-toggle");
+  const pill = $("sm-state");
+  if (!btn || !pill) return;
+  if (!sm || !sm.bridge) {
+    smForwarding = null;
+    btn.disabled = true;
+    btn.classList.remove("sel");
+    btn.textContent = "SpaceMouse → target";
+    pill.textContent = "no bridge";
+    pill.className = "pill pill-bad";
+    return;
+  }
+  btn.disabled = false;
+  smForwarding = sm.forwarding;
+  if (sm.forwarding) {
+    btn.textContent = "SpaceMouse → target: ON";
+    btn.classList.add("sel");
+    if (enabled === false) {
+      // Forwarding is on but the commander is disengaged -> nothing moves.
+      pill.textContent = "engage robot to move";
+      pill.className = "pill pill-bad";
+    } else {
+      pill.textContent = "SpaceMouse control";
+      pill.className = "pill pill-good";
+    }
+  } else {
+    btn.textContent = "SpaceMouse → target: OFF";
+    btn.classList.remove("sel");
+    pill.textContent = "dashboard control";
+    pill.className = "pill";
+  }
+}
+
 // ---- poll + render --------------------------------------------------------
 async function poll() {
   let snap;
@@ -34,6 +72,7 @@ async function poll() {
   const s = snap.status;
   $("conn").textContent = snap.fresh ? "connected" : "no commander status";
   $("conn").className = "pill " + (snap.fresh ? "pill-good" : "pill-bad");
+  updateSpacemouse(snap.spacemouse, s ? s.enabled : null);
   if (!s) return;
 
   // populate the link dropdown from the live URDF (once / when it changes)
@@ -149,11 +188,23 @@ async function onFixedToggle() {
 async function doConfigure() {
   const link = $("link-select").value;
   if (!link) { setMsg("pick a controlled link first"); return; }
+  // Link/base go through /api/configure; the commander applies a control-link
+  // change live + jump-free even while enabled (it snaps on the switch).
   const out = await postJSON("/api/configure",
     { controlled_frame: link, base_frame: $("base-select").value,
       fixed_joints: fixedJointsSelected() });
-  setMsg((out.ok ? "OK: " : "FAILED: ") + (out.message || ""));
+  setMsg((out.ok ? "link: " : "link FAILED: ") + (out.message || ""));
   poll();
+  if (window.snapTargetToLink) window.snapTargetToLink();
+}
+
+// ---- Snap target -> current pose (server-side) ---------------------------
+// Tells the commander to snap its internal target onto the controlled frame's
+// CURRENT pose (FK of the measured joints) — re-centres the goal with no jump.
+async function doSnapCurrent() {
+  const out = await postJSON("/api/snap_target", {});
+  await postJSON("/api/reanchor", {});   // also recenter the puck so it sticks
+  setMsg((out.ok ? "snapped: " : "snap failed: ") + (out.message || ""));
 }
 
 // ---- IK / motion parameters (live: each change is applied immediately) ----
@@ -250,6 +301,27 @@ function initParams(s) {
 // The control link is chosen ONLY in the panel; Snap/Track (viewer.js)
 // auto-configure + enable, so Configure is just an explicit pre-configure.
 $("btn-configure").onclick = doConfigure;
+// Changing the base (reference) link applies LIVE on its own -- base_frame is a
+// _LIVE_KEY, so send it ALONE (NOT bundled with the structural controlled_frame,
+// which would be refused while enabled). The commander relays base_frame_resolved
+// in its status so the SpaceMouse bridge re-anchors + stamps target_pose in it.
+if ($("base-select")) $("base-select").addEventListener("change", async () => {
+  const out = await postJSON("/api/configure", { base_frame: $("base-select").value });
+  setMsg((out.ok ? "base link: " : "base link FAILED: ") + (out.message || ""));
+});
+if ($("btn-snap-current")) $("btn-snap-current").onclick = doSnapCurrent;
+
+// SpaceMouse control toggle: hand target_pose between the puck and this
+// dashboard by toggling the teleop bridge's forwarding. Turning it ON also
+// ENGAGES the commander, so the puck drives the robot even if switching to
+// Read mode (or Stop) just disengaged it -- otherwise forwarding is on but the
+// commander gate is shut and nothing moves.
+$("btn-sm-toggle").onclick = async () => {
+  const next = !(smForwarding === true);
+  if (next) await postJSON("/api/enable", {});
+  const r = await postJSON("/api/spacemouse_forwarding", { enabled: next });
+  setMsg(r.message || "");
+};
 
 // IK / motion parameter inputs: apply each one live on change.
 document.querySelectorAll("[data-key]").forEach((el) => {

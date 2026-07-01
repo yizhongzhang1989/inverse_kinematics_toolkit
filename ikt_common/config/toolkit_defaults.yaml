@@ -67,6 +67,19 @@ ikt_pose_commander:
   max_step_rad: 0.8               # reject a solve that jumps any joint > this
   joint_states_stale_after: 0.5   # s
   status_rate_hz: 10.0
+  # Singularity handling (FPC control loop): near a singular configuration the
+  # synchronized stream slaves every joint to one profile and the arm crawls.
+  # Decouple into per-joint profiles there (gated on the solver's sigma_min) so
+  # each joint slews at its own cap -- the big proximal joints stay bounded and
+  # straight-line end-effector tracking is relaxed THROUGH the singular region.
+  singularity_decouple: true      # engage per-joint decoupling near singularity
+  singularity_sigma: 0.04         # sigma_min below which decoupling engages
+  singularity_exit_ratio: 2.0     # disengage above sigma*ratio (hysteresis)
+  # Per-joint caps for the decoupled mode (rad/s, rad/s^2) as a JSON object
+  # string; unlisted joints fall back to the scalars above. Empty = scalar for
+  # all. e.g. '{"joint1": 0.3, "joint2": 0.3}' to slow the big joints.
+  joint_speed_limits: ""
+  joint_accel_limits: ""
   # dashboard ("" on the commander launch = headless; the dashboard launch
   # defaults its own port to this value)
   host: "0.0.0.0"

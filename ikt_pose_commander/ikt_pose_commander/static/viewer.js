@@ -5,7 +5,7 @@
 // configuration (per-link FK computed server-side, mirrored from the
 // ikt_inverse_kinematics dashboard) PLUS a triad + sphere at the *commanded
 // target pose* (whatever is currently on <ns>/target_pose — the dashboard's own
-// jog/send OR the spacemouse_servo teleop bridge).
+// jog/send OR the SpaceMouse pose_node).
 //
 // On top of the basic robot + target view it adds (referring to the other
 // toolkit dashboards):
@@ -17,6 +17,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { STLLoader } from "three/addons/loaders/STLLoader.js";
+import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 
 const $ = (id) => document.getElementById(id);
@@ -51,7 +52,8 @@ scene.add(new THREE.HemisphereLight(0xb0d4f1, 0x404040, 0.85));
 const d1 = new THREE.DirectionalLight(0xffffff, 1.2); d1.position.set(3, 5, 4); scene.add(d1);
 const d2 = new THREE.DirectionalLight(0xffffff, 0.4); d2.position.set(-2, 3, -1); scene.add(d2);
 const grid = new THREE.GridHelper(3, 30, 0x445, 0x334); grid.rotation.x = Math.PI / 2; scene.add(grid);
-scene.add(new THREE.AxesHelper(0.25));   // base-frame triad at the origin
+const BASE_AXES_LEN = 0.25;
+scene.add(new THREE.AxesHelper(BASE_AXES_LEN));   // base-frame triad at the origin
 
 // ---- target marker (sphere + triad), driven by the live target ----------
 const targetGroup = new THREE.Group();
@@ -65,8 +67,11 @@ const solidMat = new THREE.MeshStandardMaterial({ color: 0x9fb4c4, metalness: 0.
 const highlightMat = new THREE.MeshStandardMaterial({ color: 0xffb454, emissive: 0x6e3d00,
   emissiveIntensity: 0.6, metalness: 0.2, roughness: 0.5 });
 const stlLoader = new STLLoader();
-const geomCache = {};   // url -> {geom, waiting:[cb]}
-const meshItems = {};   // key(link#i) -> {link, local, solid}
+const colladaLoader = new ColladaLoader();
+// url -> {kind:"stl"|"dae", obj, ready, waiting:[cb]}; obj = BufferGeometry (STL)
+// or the loaded COLLADA scene Group (DAE). Loaded once per url, cloned per use.
+const protoCache = {};
+const meshItems = {};   // key(link#i) -> {link, local, solid, kind}
 const frameAxes = {};   // link -> AxesHelper
 const labelPool = [];   // reusable label divs (clustered, not per-link)
 const fixedLabelPool = []; // reusable divs for the "FIXED" joint markers
@@ -93,19 +98,35 @@ function dropdown() { return $("link-select"); }
 function setSelected(link) {
   selectedLink = link || "";
   if ($("sel-link")) $("sel-link").textContent = selectedLink || "\u2014";
+  invalidate();
 }
 
-function getGeom(url, cb) {
-  const c = geomCache[url];
-  if (c && c.geom) { cb(c.geom); return; }
+// Mesh format is taken from the file extension. Direct URLs end in the ext
+// (.stl); the server's /mesh proxy carries it in a `path=` query param
+// (e.g. /mesh?pkg=ur_description&path=meshes/ur15/visual/base.dae).
+function meshExt(url) {
+  const m = /[?&]path=([^&]+)/.exec(url);
+  const p = m ? decodeURIComponent(m[1]) : url.split("?")[0];
+  const dot = p.lastIndexOf(".");
+  return dot >= 0 ? p.slice(dot + 1).toLowerCase() : "";
+}
+// Load a mesh url once (STL -> BufferGeometry, COLLADA -> scene Group) and cache
+// it; callers clone/instantiate per link. cb receives the cache entry.
+function loadProto(url, cb) {
+  const c = protoCache[url];
+  if (c && c.ready) { cb(c); return; }
   if (c) { c.waiting.push(cb); return; }
-  geomCache[url] = { geom: null, waiting: [cb] };
-  stlLoader.load(url, (g) => {
-    g.computeVertexNormals();
-    geomCache[url].geom = g;
-    geomCache[url].waiting.forEach((f) => f(g));
-    geomCache[url].waiting = [];
-  }, undefined, () => { /* load error: skeleton still shows */ });
+  const entry = protoCache[url] = { kind: meshExt(url), obj: null, ready: false, waiting: [cb] };
+  const done = (obj) => {
+    entry.obj = obj; entry.ready = true;
+    entry.waiting.forEach((f) => f(entry)); entry.waiting = [];
+  };
+  const fail = () => { entry.waiting = []; };   // load error: skeleton still shows
+  if (entry.kind === "dae") {
+    colladaLoader.load(url, (collada) => done(collada.scene), undefined, fail);
+  } else {
+    stlLoader.load(url, (g) => { g.computeVertexNormals(); done(g); }, undefined, fail);
+  }
 }
 function localMatrix(xyz, rpy, scale) {
   const m = new THREE.Matrix4();
@@ -119,16 +140,91 @@ function rosMat(a) {
     a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3],
     a[2][0], a[2][1], a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3]);
 }
+
+// ---- pose smoothing + on-demand rendering (ported from robot_test_dashboard)
+// Each poll sets a TARGET pose; the render loop eases the DISPLAYED robot toward
+// it every frame and only draws when something changed (robot easing, camera or
+// gizmo moving, or invalidate()), so an idle canvas is nearly free. Commander
+// logic (snap / track) keeps using the TRUE pose in window.__lastLinkTf; only
+// the on-screen robot is smoothed (dispTf).
+const SMOOTH_TAU = 0.06, POS_EPS = 1e-4, ANG_EPS = 5e-4;
+const _ONE = new THREE.Vector3(1, 1, 1);
+const _dm = new THREE.Matrix4(), _cm = new THREE.Matrix4(), _hm = new THREE.Matrix4();
+const _dp = new THREE.Vector3(), _dq = new THREE.Quaternion(), _dsc = new THREE.Vector3();
+let targetPose = {};
+const dispPose = {}, dispTf = {};
+let needsRender = true;
+function invalidate() { needsRender = true; }
+THREE.DefaultLoadingManager.onLoad = invalidate;
+function rosMatInto(m, a) {
+  return m.set(
+    a[0][0], a[0][1], a[0][2], a[0][3], a[1][0], a[1][1], a[1][2], a[1][3],
+    a[2][0], a[2][1], a[2][2], a[2][3], a[3][0], a[3][1], a[3][2], a[3][3]);
+}
+function writeDispArray(link, pos, quat) {
+  _cm.compose(pos, quat, _ONE);
+  const e = _cm.elements;
+  let a = dispTf[link];
+  if (!a) a = dispTf[link] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]];
+  a[0][0] = e[0]; a[0][1] = e[4]; a[0][2] = e[8];  a[0][3] = e[12];
+  a[1][0] = e[1]; a[1][1] = e[5]; a[1][2] = e[9];  a[1][3] = e[13];
+  a[2][0] = e[2]; a[2][1] = e[6]; a[2][2] = e[10]; a[2][3] = e[14];
+}
+function setTargetPose(linkTf) {
+  const next = {}; let changed = false;
+  for (const link in (linkTf || {})) {
+    rosMatInto(_dm, linkTf[link]); _dm.decompose(_dp, _dq, _dsc);
+    next[link] = { pos: _dp.clone(), quat: _dq.clone() };
+    if (!dispPose[link]) { dispPose[link] = { pos: _dp.clone(), quat: _dq.clone() }; writeDispArray(link, _dp, _dq); changed = true; }
+  }
+  for (const link in dispPose) if (!next[link]) { delete dispPose[link]; delete dispTf[link]; changed = true; }
+  targetPose = next;
+  if (changed) invalidate();
+}
+function advanceInterp(dt) {
+  const alpha = 1 - Math.exp(-dt / SMOOTH_TAU); let moving = false;
+  for (const link in targetPose) {
+    const t = targetPose[link];
+    let d = dispPose[link] || (dispPose[link] = { pos: t.pos.clone(), quat: t.quat.clone() });
+    if (d.pos.distanceTo(t.pos) < POS_EPS && d.quat.angleTo(t.quat) < ANG_EPS) continue;
+    d.pos.lerp(t.pos, alpha); d.quat.slerp(t.quat, alpha);
+    writeDispArray(link, d.pos, d.quat); moving = true;
+  }
+  return moving;
+}
+// Pose-dependent robot geometry at the smoothed pose (labels placed separately).
+function placeGeometry(tf) {
+  placeCurrent(tf); placeFrames(tf); placeHighlights(tf);
+  updateSkeleton(tf, !opt.mesh || !window.__hasMeshes);
+}
+
 function ensureMeshes(visuals) {
   visuals.forEach((v, i) => {
     const key = v.link + "#" + i;
     if (meshItems[key] !== undefined) return;
-    const item = { link: v.link, local: localMatrix(v.xyz, v.rpy, v.scale), solid: null };
+    const item = { link: v.link, local: localMatrix(v.xyz, v.rpy, v.scale), solid: null, kind: null };
     meshItems[key] = item;
-    getGeom(v.url, (geom) => {
-      const s = new THREE.Mesh(geom, solidMat); s.matrixAutoUpdate = false;
-      s.userData.link = v.link;          // for raycast → link lookup
-      item.solid = s; scene.add(s);
+    loadProto(v.url, (entry) => {
+      let obj;
+      if (entry.kind === "dae") {
+        // ColladaLoader rotates a Z_UP asset by -90deg about X to fit three's
+        // Y-up world (vertices are NOT converted). Our scene is ROS Z-up (we
+        // place link_tf directly) and the UR .dae vertices are authored Z-up to
+        // match the link frame, so we UNDO that up-axis tilt (keeping the unit
+        // scale) and place the clone via rosMat*local exactly like an STL.
+        // Without this every link is tipped 90deg and the arm looks disconnected.
+        const inner = entry.obj.clone(true);
+        inner.rotation.set(0, 0, 0);          // remove the Z_UP -> Y_UP tilt
+        inner.updateMatrix();
+        inner.traverse((o) => { if (o.isMesh) o.userData.link = v.link; });
+        obj = new THREE.Group(); obj.add(inner);
+      } else {
+        obj = new THREE.Mesh(entry.obj, solidMat);
+      }
+      obj.matrixAutoUpdate = false;
+      obj.userData.link = v.link;          // for raycast → link lookup
+      item.kind = entry.kind; item.solid = obj; scene.add(obj);
+      invalidate();
     });
   });
 }
@@ -136,10 +232,15 @@ function placeCurrent(linkTf) {
   for (const key in meshItems) {
     const it = meshItems[key]; if (!it.solid) continue;
     const lm = linkTf[it.link];
-    if (!lm || !opt.mesh) { it.solid.visible = false; continue; }
+    if (!lm || !opt.mesh) { if (it.solid.visible) it.solid.visible = false; continue; }
     it.solid.visible = true;
-    it.solid.material = (it.link === selectedLink) ? highlightMat : solidMat;
-    it.solid.matrix.copy(rosMat(lm).multiply(it.local));
+    // STL meshes get the solid/highlight material swap; COLLADA keeps its own
+    // materials (the selected link is flagged by the wide highlight frame).
+    if (it.kind !== "dae") {
+      const mat = (it.link === selectedLink) ? highlightMat : solidMat;
+      if (it.solid.material !== mat) it.solid.material = mat;
+    }
+    it.solid.matrix.multiplyMatrices(rosMatInto(_hm, lm), it.local);
   }
 }
 
@@ -155,9 +256,58 @@ function ensureFrames(linkTf) {
 function placeFrames(linkTf) {
   for (const link in frameAxes) {
     const ax = frameAxes[link]; const lm = linkTf[link];
-    if (!lm || !opt.frames) { ax.visible = false; continue; }
-    ax.visible = true; ax.matrix.copy(rosMat(lm));
+    if (!lm || !opt.frames) { if (ax.visible) ax.visible = false; continue; }
+    ax.visible = true; rosMatInto(ax.matrix, lm);
   }
+}
+
+// ---- highlight frames for the selected control + base links --------------
+// The selected control link and the base (reference) link each get a WIDE
+// coordinate triad. It is built from solid cylinders rather than a plain
+// THREE.AxesHelper because line width is ignored on most GPUs, so the axes
+// read as thick 3D bars that stand out clearly from the thin per-link frames.
+// Always shown (independent of the "frames" toggle) since these are the two
+// links the operator is actively configuring. A colored origin ball tags each:
+// amber = control link (matches the orange mesh highlight), cyan = base link.
+function makeFatAxes(len, rad, ballColor) {
+  const g = new THREE.Group();
+  g.matrixAutoUpdate = false; g.visible = false;
+  const shaft = (color, axis) => {
+    const geom = new THREE.CylinderGeometry(rad, rad, len, 16);
+    geom.translate(0, len / 2, 0);                 // base at origin, tip at +len
+    const m = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color }));
+    if (axis === "x") m.rotation.z = -Math.PI / 2;     // default +Y -> +X
+    else if (axis === "z") m.rotation.x = Math.PI / 2; // default +Y -> +Z
+    return m;                                          // axis === "y": as-is
+  };
+  g.add(shaft(0xff3b30, "x"));   // X red
+  g.add(shaft(0x34c759, "y"));   // Y green
+  g.add(shaft(0x2e7bff, "z"));   // Z blue
+  g.add(new THREE.Mesh(new THREE.SphereGeometry(rad * 2.4, 16, 16),
+    new THREE.MeshBasicMaterial({ color: ballColor })));
+  return g;
+}
+// Highlight triads are kept SHORTER than the base/origin triad (BASE_AXES_LEN)
+// so they flag the selected links without dominating the view. Tune here.
+const HIGHLIGHT_AXES_LEN = 0.10;
+const ctrlHighlight = makeFatAxes(HIGHLIGHT_AXES_LEN, 0.008, 0xffb454);   // selected control link
+const baseHighlight = makeFatAxes(HIGHLIGHT_AXES_LEN, 0.007, 0x26c6da);   // base / reference link
+scene.add(ctrlHighlight); scene.add(baseHighlight);
+
+// Place the two highlight triads on their links' current poses. The control
+// link follows the panel selection; the base link follows the base-select
+// dropdown, falling back to the model root when "(robot root)" is chosen.
+function placeHighlights(linkTf) {
+  const ctrlLink = selectedLink || controlledFrame;
+  const cm = ctrlLink && linkTf[ctrlLink];
+  if (cm) { ctrlHighlight.visible = true; ctrlHighlight.matrix.copy(rosMat(cm)); }
+  else ctrlHighlight.visible = false;
+
+  const bsel = $("base-select");
+  const baseLink = (bsel && bsel.value) || rootFrame;
+  const bm = baseLink && linkTf[baseLink];
+  if (bm) { baseHighlight.visible = true; baseHighlight.matrix.copy(rosMat(bm)); }
+  else baseHighlight.visible = false;
 }
 
 // ---- per-link name labels (HTML overlay, clustered) ---------------------
@@ -301,6 +451,7 @@ function resetView(linkTf) {
   const sz = box.getSize(new THREE.Vector3()).length() || 1.0;
   controls.target.copy(c);
   camera.position.set(c.x + sz, c.y - sz, c.z + sz * 0.7); controls.update();
+  invalidate();
 }
 function fitView(linkTf) {
   if (didFit) return;
@@ -334,8 +485,6 @@ let readMode = true;         // dashboard mode: true = Read/monitor, false = Sen
 let controlledFrame = "";    // commander's current controlled_frame
 let rootFrame = "";          // model root frame name (target frame_id)
 let _proxyInit = false;      // target frame placed at least once
-let _lastStreamT = 0;
-const STREAM_MIN_MS = 40;    // throttle live FPC streaming to ~25 Hz
 
 gizmo.addEventListener("dragging-changed", (e) => {
   controls.enabled = !e.value;                 // don't orbit while dragging a handle
@@ -343,15 +492,17 @@ gizmo.addEventListener("dragging-changed", (e) => {
 });
 gizmo.addEventListener("objectChange", () => {
   if (readMode || !tracking) return;            // commands only in Send mode while tracking
-  const now = performance.now();
-  if (now - _lastStreamT >= STREAM_MIN_MS) { _lastStreamT = now; sendProxyTarget(true); }
+  sendProxyTarget(true);                        // publish EVERY gizmo pose (no drop)
 });
+// any gizmo visual change (hover highlight, drag, mode switch) -> redraw
+gizmo.addEventListener("change", invalidate);
 
 function setProxyFromMat(m4) {
   rosMat(m4).decompose(targetProxy.position, targetProxy.quaternion, targetProxy.scale);
   targetProxy.scale.set(1, 1, 1);
   targetProxy.updateMatrixWorld(true);
   _proxyInit = true;
+  invalidate();
 }
 
 async function api(url, body) {
@@ -396,7 +547,7 @@ async function engage(mode) {
   if (!link) { actionMsg("pick a controlled link first"); return false; }
   let snap = await api("/api/state");
   let s = snap && snap.status;
-  const needCfg = !s || !s.configured || s.controlled_frame !== link || s.mode !== mode;
+  const needCfg = !s || !s.configured || s.mode !== mode;
   if (needCfg) {
     if (s && s.enabled) await gizmoPost("/api/disable");
     const cfg = { controlled_frame: link, base_frame: base, command_mode: mode };
@@ -407,9 +558,11 @@ async function engage(mode) {
     for (let i = 0; i < 40; i++) {
       await sleep(100);
       snap = await api("/api/state"); s = snap && snap.status;
-      if (s && s.configured && s.mode === mode && s.controlled_frame === link) { ok = true; break; }
+      if (s && s.configured && s.mode === mode) { ok = true; break; }
     }
     if (!ok) { actionMsg("configure to " + mode + " failed: " + (s ? s.last_message : "")); return false; }
+  } else if (s.controlled_frame !== link) {
+    await gizmoPost("/api/configure", { controlled_frame: link, base_frame: base });
   }
   if (snap && snap.root_frame) rootFrame = snap.root_frame;
   if (!s.enabled) { const r = await gizmoPost("/api/enable"); if (!r.ok) { actionMsg("enable failed: " + (r.message || "")); return false; } }
@@ -455,6 +608,9 @@ function setGizmoMode(mode) {
 if ($("gizmo-move")) $("gizmo-move").onclick = () => setGizmoMode("translate");
 if ($("gizmo-rotate")) $("gizmo-rotate").onclick = () => setGizmoMode("rotate");
 if ($("btn-snap-target")) $("btn-snap-target").onclick = snapTargetToLink;
+// Expose so the Configure button (dashboard.js) can snap the gizmo to the
+// newly controlled link right after configuring.
+window.snapTargetToLink = snapTargetToLink;
 if ($("btn-snap-robot")) $("btn-snap-robot").onclick = snapRobot;
 if ($("btn-track-robot")) $("btn-track-robot").onclick = trackRobot;
 if ($("btn-disable")) $("btn-disable").onclick = stopRobot;
@@ -463,7 +619,16 @@ if ($("btn-disable")) $("btn-disable").onclick = stopRobot;
 // "match" the target). Skipped while live-tracking so an active FPC stream isn't
 // yanked to a new pose mid-motion.
 if ($("link-select")) $("link-select").addEventListener("change", () => {
-  if (!readMode && !tracking && window.__lastLinkTf) snapTargetToLink();
+  // Tell the commander the new link via /api/configure (live, jump-free while
+  // enabled); it snaps to the current EE. Then align the gizmo. Enabled or not.
+  const link = $("link-select").value, base = ($("base-select") && $("base-select").value) || "";
+  setSelected(link);                       // highlight the new control link at once
+  gizmoPost("/api/configure", { controlled_frame: link, base_frame: base });
+  if (window.__lastLinkTf) { snapTargetToLink(); invalidate(); }
+});
+// Re-place the base highlight as soon as the base (reference) link changes.
+if ($("base-select")) $("base-select").addEventListener("change", () => {
+  invalidate();
 });
 
 // ---- dashboard Read / Send mode ----------------------------------------
@@ -480,6 +645,7 @@ function updateModeUI() {
   const tf = $("tf-ctl-row"); if (tf) tf.style.display = readMode ? "none" : "";
   const eng = $("engage-ctl-row"); if (eng) eng.style.display = readMode ? "none" : "";
   const hint = $("grab-hint"); if (hint) hint.style.display = readMode ? "none" : "";
+  invalidate();
 }
 async function setDashMode(read) {
   readMode = !!read;
@@ -596,12 +762,7 @@ function updateTcp(linkTf, frame) {
 
 // Re-apply visibility/highlight to the static scene after a toggle change,
 // using the last link transforms (no need to wait for the next poll).
-function refreshStatic() {
-  const tf = window.__lastLinkTf;
-  if (!tf) return;
-  placeCurrent(tf); placeFrames(tf); placeLabels(tf);
-  updateSkeleton(tf, !opt.mesh || !window.__hasMeshes);
-}
+function refreshStatic() { invalidate(); }   // the render loop re-places everything
 
 // ---- poll ---------------------------------------------------------------
 async function poll() {
@@ -621,10 +782,9 @@ async function poll() {
     fixedJoints = (s.status && s.status.fixed_joints) || [];
     if (s.has_meshes) ensureMeshes(s.visuals || []);
     ensureFrames(tf);
-    placeCurrent(tf); placeFrames(tf); placeLabels(tf); placeFixedLabels(tf);
-    updateSkeleton(tf, !opt.mesh || !s.has_meshes);
+    setTargetPose(tf);      // feed the smoother; the render loop eases + places it
     fitView(tf);
-    window.__lastLinkTf = tf;
+    window.__lastLinkTf = tf;   // commander logic (snap/track) uses the TRUE pose
     // floating-overlay counts + model pill
     if ($("n-links")) $("n-links").textContent = (s.links || []).length || "—";
     if ($("n-joints")) $("n-joints").textContent = (s.joints || []).length || "—";
@@ -650,6 +810,10 @@ async function poll() {
     if (!selectedLink && s.controlled_frame) setSelected(s.controlled_frame);
   }
   updateTarget(s.target);
+  // redraw when the commanded target / controlled frame / fixed joints / mesh set change
+  const sig = JSON.stringify([s.target, s.controlled_frame,
+    (s.status && s.status.fixed_joints) || [], (s.visuals || []).map((v) => v.link)]);
+  if (sig !== window.__pcSig) { window.__pcSig = sig; invalidate(); }
 }
 if ($("fit")) $("fit").onclick = () => resetView();
 // collapse / expand the floating overlay
@@ -661,8 +825,10 @@ if ($("vf-collapse")) $("vf-collapse").onclick = () => {
 };
 poll(); setInterval(poll, 120);
 
-// ---- render loop --------------------------------------------------------
-function resizeToDisplay() {
+// ---- render loop (on-demand) --------------------------------------------
+let _pendingResize = true;
+function applyResize() {
+  _pendingResize = false;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h) return;
   const pr = renderer.getPixelRatio();
@@ -671,9 +837,21 @@ function resizeToDisplay() {
     camera.aspect = w / h; camera.updateProjectionMatrix();
   }
 }
-(function animate() {
+new ResizeObserver(() => { _pendingResize = true; invalidate(); }).observe(canvas);
+let _prevT = performance.now();
+(function animate(now) {
   requestAnimationFrame(animate);
-  resizeToDisplay(); controls.update(); renderer.render(scene, camera);
-  // labels track the camera every frame (cheap; ~9 divs)
-  if (window.__lastLinkTf) { placeLabels(window.__lastLinkTf); placeFixedLabels(window.__lastLinkTf); }
+  const t = now || performance.now();
+  const dt = Math.min(0.1, Math.max(0, (t - _prevT) * 0.001)); _prevT = t;
+  if (_pendingResize) applyResize();
+  const moving = advanceInterp(dt);
+  const camMoved = controls.update();
+  const geomDirty = moving || needsRender;
+  if (geomDirty || camMoved) {
+    if (geomDirty) placeGeometry(dispTf);
+    // labels track the camera too (cheap; ~9 divs)
+    placeLabels(dispTf); placeFixedLabels(dispTf);
+    renderer.render(scene, camera);
+    needsRender = false;
+  }
 })();

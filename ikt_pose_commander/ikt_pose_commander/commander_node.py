@@ -101,7 +101,10 @@ _LIVE_KEYS = (
     "joint_states_stale_after", "joint_centering_weight", "damping",
     "tol_pos", "tol_ori", "max_iters", "default_stiffness",
     "allow_unreachable", "reach_gain",
+    "joint_lock_weight",
     "control_rate_hz",
+    "singularity_decouple", "singularity_sigma", "singularity_exit_ratio",
+    "joint_speed_limits", "joint_accel_limits",
 )
 _STRUCTURAL_KEYS = (
     "controlled_frame", "joints", "fixed_joints", "jtc_controller",
@@ -176,6 +179,9 @@ class PoseCommander(Node):
         # for gradual, smoother stretching. 1.0 = full step (today's behaviour).
         self.declare_parameter("reach_gain", 1.0)
         self.declare_parameter("joint_centering_weight", 1e-2)
+        # joint_lock_weight: secondary null-space term that keeps q at the SEED
+        # (current pose) -- pins redundant joints so they don't drift. 0 = off.
+        self.declare_parameter("joint_lock_weight", 0.0)
         self.declare_parameter("damping", 1e-2)
         self.declare_parameter("tol_pos", 1e-3)
         self.declare_parameter("tol_ori", 3.5e-3)
@@ -197,6 +203,30 @@ class PoseCommander(Node):
         # Capped at _CONTROL_RATE_MAX_HZ.
         self.declare_parameter("control_rate_hz", 200.0)
         self.declare_parameter("status_rate_hz", 10.0)
+        # ---- singularity handling (FPC control loop) -----------------------
+        # Near a singular configuration the synchronized FPC generator slaves
+        # every joint to ONE shared profile, so a barely-advancing or
+        # big-reconfiguration IK goal makes the WHOLE arm crawl. With
+        # singularity_decouple on, the generator switches -- gated on the
+        # solver's sigma_min (smallest Jacobian singular value) -- to a
+        # DECOUPLED per-joint profile: each joint slews toward its goal at its
+        # OWN max speed, so small-travel joints finish quickly while the big
+        # proximal joints stay capped. This gives up straight-line end-effector
+        # tracking THROUGH the singular region (the explicit trade-off) in
+        # exchange for not crawling and for bounding the big joints. Hysteresis:
+        # engage when sigma_min < singularity_sigma, disengage when it rises
+        # back above singularity_sigma * singularity_exit_ratio.
+        self.declare_parameter("singularity_decouple", True)
+        self.declare_parameter("singularity_sigma", 0.04)
+        self.declare_parameter("singularity_exit_ratio", 2.0)
+        # Per-joint speed/accel caps (rad/s, rad/s^2) for the DECOUPLED mode, as
+        # a JSON object string ``joint_name -> limit``, e.g.
+        # '{"joint1": 0.3, "joint2": 0.3}'. Lower the big proximal joints here.
+        # A joint not listed falls back to the scalar max_joint_speed /
+        # max_joint_accel; empty = the scalar for every joint (decoupling alone
+        # still removes the crawl). Live-settable.
+        self.declare_parameter("joint_speed_limits", "")
+        self.declare_parameter("joint_accel_limits", "")
 
         gp = self.get_parameter
         self._desc_topic = str(gp("robot_description_topic").value)
@@ -229,6 +259,7 @@ class PoseCommander(Node):
         self._allow_unreachable = bool(gp("allow_unreachable").value)
         self._reach_gain = min(1.0, max(1e-3, float(gp("reach_gain").value)))
         self._centering = float(gp("joint_centering_weight").value)
+        self._lock_w = float(gp("joint_lock_weight").value)
         self._damping = float(gp("damping").value)
         self._tol_pos = float(gp("tol_pos").value)
         self._tol_ori = float(gp("tol_ori").value)
@@ -241,6 +272,13 @@ class PoseCommander(Node):
         self._control_rate = max(0.0, min(_CONTROL_RATE_MAX_HZ,
                                           float(gp("control_rate_hz").value)))
         status_rate = max(0.5, float(gp("status_rate_hz").value))
+        self._sing_decouple = bool(gp("singularity_decouple").value)
+        self._sing_sigma = max(0.0, float(gp("singularity_sigma").value))
+        self._sing_exit_ratio = max(1.0, float(gp("singularity_exit_ratio").value))
+        self._joint_speed_limits = self._parse_joint_map(
+            gp("joint_speed_limits").value)
+        self._joint_accel_limits = self._parse_joint_map(
+            gp("joint_accel_limits").value)
 
         if self._mode not in ("jtc", "fpc"):
             raise ValueError("command_mode must be 'jtc' or 'fpc'")
@@ -263,12 +301,14 @@ class PoseCommander(Node):
         self._enabled = False
         self._configured = False
         self._last_msg = "initialised (disabled, unconfigured)"
-        # Throttle repeated _set_msg logs: a high-rate target stream into a
-        # disabled/unconfigured commander would otherwise flood the log at the
-        # stream rate. We always update the status field, but only emit an INFO
-        # line when the message text changes or a heartbeat interval elapses.
-        self._last_logged_msg = ""
-        self._last_log_time = 0.0
+        # Throttle repeated _set_msg logs PER DISTINCT MESSAGE: the SpaceMouse
+        # pose_node streams BOTH curr_pose and delta_pose at 100 Hz, so a
+        # disabled commander can get two DIFFERENT "ignored" messages
+        # interleaved -- a single last-message dedupe is defeated by the
+        # alternation and floods the console. Key the throttle by message text so
+        # each distinct line is emitted at most once per heartbeat interval (the
+        # status field is still updated every call).
+        self._log_times: Dict[str, float] = {}
         self._last_target_stamp = 0.0
         self._last_solution = None
         self._last_reason = ""
@@ -297,6 +337,10 @@ class PoseCommander(Node):
         # end-effector travels directly toward the target instead of curving /
         # shaking). See trajectory.SyncedJointTrajectory.
         self._traj: Optional[SyncedJointTrajectory] = None
+        # Hysteretic gate state: True while the FPC generator is in the
+        # DECOUPLED per-joint mode (inside a singular region). Reset on
+        # enable/disable/reconfigure alongside self._traj.
+        self._decoupled_active = False
         # control loop (Phase 3): latest resolved target + its timer
         self._last_target = None              # (xyz, quat) in the solver frame
         # Goal cache (control-loop / FPC): the solved+gated controlled-joint goal
@@ -386,6 +430,11 @@ class PoseCommander(Node):
                             callback_group=cb)
         self.create_service(Trigger, "~/return_to_start",
                             self._srv_return_to_start, callback_group=cb)
+        # Snap the internal target onto the CURRENT pose of the controlled frame
+        # (forward kinematics of the measured joints). Use it to seed the goal
+        # before delta jogging, or to re-centre the target with no jump.
+        self.create_service(Trigger, "~/snap_target",
+                            self._srv_snap_target, callback_group=cb)
 
         self.create_timer(1.0 / status_rate, self._publish_status,
                           callback_group=cb)
@@ -483,6 +532,18 @@ class PoseCommander(Node):
         if not any(k in req for k in (_LIVE_KEYS + _STRUCTURAL_KEYS)):
             self._set_msg("configure ignored: no known config keys")
             return
+        # A control-link change while ENABLED is applied LIVE and jump-free
+        # (hold -> back to JTC -> reconfigure -> snap -> re-enable) instead of
+        # being refused, so the link can be retargeted without disabling first.
+        # base_frame and any live tunables in the same request ride along.
+        with self._lock:
+            enabled = self._enabled
+            cur_frame = self._frame
+            have_model = self._model is not None
+        want_frame = str(req.get("controlled_frame") or "").strip()
+        if enabled and have_model and want_frame and want_frame != cur_frame:
+            self._switch_control_link(req)
+            return
         # Live tunables apply immediately, even before a model exists.
         live = self._apply_live(req)
         if not any(k in req for k in _STRUCTURAL_KEYS):
@@ -573,9 +634,12 @@ class PoseCommander(Node):
                 ("max_step_rad", "_max_step", None),
                 ("joint_states_stale_after", "_js_stale", None),
                 ("joint_centering_weight", "_centering", None),
+                ("joint_lock_weight", "_lock_w", 0.0),
                 ("damping", "_damping", None),
                 ("tol_pos", "_tol_pos", None),
                 ("tol_ori", "_tol_ori", None),
+                ("singularity_sigma", "_sing_sigma", 0.0),
+                ("singularity_exit_ratio", "_sing_exit_ratio", 1.0),
             ):
                 if req.get(key) is None:
                     continue
@@ -611,6 +675,19 @@ class PoseCommander(Node):
                     changed.append("reach_gain=%g" % self._reach_gain)
                 except (TypeError, ValueError):
                     pass
+            if req.get("singularity_decouple") is not None:
+                self._sing_decouple = self._as_bool(req["singularity_decouple"])
+                changed.append("singularity_decouple=%s" % self._sing_decouple)
+            if req.get("joint_speed_limits") is not None:
+                self._joint_speed_limits = self._parse_joint_map(
+                    req["joint_speed_limits"])
+                changed.append("joint_speed_limits=%d"
+                               % len(self._joint_speed_limits))
+            if req.get("joint_accel_limits") is not None:
+                self._joint_accel_limits = self._parse_joint_map(
+                    req["joint_accel_limits"])
+                changed.append("joint_accel_limits=%d"
+                               % len(self._joint_accel_limits))
             if req.get("control_rate_hz") is not None:
                 try:
                     self._control_rate = max(0.0, min(
@@ -646,6 +723,31 @@ class PoseCommander(Node):
         if isinstance(value, (int, float)):
             return bool(value)
         return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _parse_joint_map(value) -> Dict[str, float]:
+        """Parse a per-joint limit map (joint -> positive float) from a dict or a
+        JSON object string. Returns {} on empty/invalid so callers fall back to
+        the scalar limit. Non-positive / non-numeric entries are dropped."""
+        if value is None or value == "":
+            return {}
+        src = value
+        if not isinstance(src, dict):
+            try:
+                src = json.loads(str(value))
+            except (ValueError, TypeError):
+                return {}
+        if not isinstance(src, dict):
+            return {}
+        out: Dict[str, float] = {}
+        for k, v in src.items():
+            try:
+                f = float(v)
+            except (ValueError, TypeError):
+                continue
+            if f > 0.0:
+                out[str(k)] = f
+        return out
 
     def _reconcile_control_timer(self) -> None:
         """Create/destroy/retune the control-loop timer to match _control_rate.
@@ -758,6 +860,7 @@ class PoseCommander(Node):
                 self._rejected_target_xyz = None
                 self._rejected_target_quat = None
                 self._traj = None
+                self._decoupled_active = False
                 if not self._enabled:
                     # disabled: re-capture the start pose on the next ~/enable.
                     self._start_q = None
@@ -988,6 +1091,25 @@ class PoseCommander(Node):
     # ------------------------------------------------------------------ #
     # Main path: target -> solve -> gate -> command
     # ------------------------------------------------------------------ #
+    def _switch_control_link(self, cfg: dict) -> None:
+        """Change control_link while ENABLED: hold, switch back to JTC, apply the
+        new group, snap the goal to the current pose (no jump), then re-enable."""
+        with self._lock:
+            self._enabled = False
+            mode, jtc, fpc = self._mode, self._jtc, self._fpc
+        if self._do_switch and mode == "fpc" and jtc and fpc:
+            self._switch(activate=[jtc], deactivate=[fpc])
+        ok, m = self._apply_config(cfg)
+        if not ok:
+            self._set_msg("control_link switch failed: " + m)
+            return
+        self._snap_target()
+        ok, m = self._try_enable()
+        if ok:
+            self._snap_target()
+        self._set_msg("control_link -> %s (live switch)"
+                      % cfg.get("controlled_frame"))
+
     def _on_target(self, msg: PoseStamped) -> None:
         with self._lock:
             self._last_target_stamp = time.monotonic()
@@ -1186,11 +1308,83 @@ class PoseCommander(Node):
                     q[model.q_index(jn)] = float(v)
         return q
 
+    def _measured_seed(self, model: "RobotModel") -> np.ndarray:
+        """Neutral config overlaid with the latest MEASURED joints only.
+
+        Unlike ``_build_seed`` this never substitutes the commanded FPC stream,
+        so forward kinematics off it report where the arm PHYSICALLY is -- used
+        by ``_snap_target`` to snap the goal onto the true current frame pose.
+        """
+        q = model.neutral()
+        with self._lock:
+            jp = dict(self._joint_pos)
+        for jn in model.joint_names:
+            if jn in jp:
+                q[model.q_index(jn)] = jp[jn]
+        return q
+
+    def _frame_pose_now(self):
+        """Return (xyz, quat_wxyz) of the controlled frame at the MEASURED joints,
+        expressed in the model root frame, or ``None`` if it can't be computed."""
+        with self._lock:
+            model = self._model
+            frame = self._frame
+        if model is None or not frame:
+            return None
+        seed = self._measured_seed(model)
+        with self._fk_lock:
+            xyz, quat = model.fk(seed, frame)
+        return np.asarray(xyz, dtype=float), np.asarray(quat, dtype=float)
+
+    def _snap_target(self):
+        """Set the internal target to the CURRENT pose of the controlled frame.
+
+        Computes forward kinematics of the measured joints for the controlled
+        frame and stores it as the goal (root frame), invalidating the solve
+        caches so the next tick tracks it. Use it to seed the goal before delta
+        jogging, or to re-centre the target onto the live pose with no jump.
+        Works whether enabled or disabled; needs a configured frame, a model and
+        fresh joint states.
+        """
+        with self._lock:
+            model = self._model
+            frame = self._frame
+            configured = self._configured
+        if not configured or not frame:
+            return False, "unconfigured; set the control frame first"
+        if model is None:
+            return False, "no robot_description yet"
+        if not self._js_fresh():
+            return False, "/joint_states stale; cannot snap"
+        pose = self._frame_pose_now()
+        if pose is None:
+            return False, "could not compute frame pose"
+        xyz, quat = pose
+        with self._lock:
+            self._last_target = (xyz, quat)
+            self._last_target_stamp = time.monotonic()
+            # Re-solve to the snapped pose on the next tick.
+            self._cached_goal = None
+            self._cached_target_xyz = None
+            self._cached_target_quat = None
+            self._rejected_target_xyz = None
+            self._rejected_target_quat = None
+        self._set_msg("target snapped to current pose of %s" % frame)
+        return True, ("snapped to %s [x=%.3f y=%.3f z=%.3f]"
+                      % (frame, xyz[0], xyz[1], xyz[2]))
+
+    def _srv_snap_target(self, request, response):
+        ok, msg = self._snap_target()
+        response.success = ok
+        response.message = msg
+        return response
+
     def _solve(self, model, seed, xyz, quat):
         params = ik_core.SolveParams(
             max_iters=self._max_iters, tol_pos=self._tol_pos,
             tol_ori=self._tol_ori, damping=self._damping,
-            joint_centering_weight=self._centering)
+            joint_centering_weight=self._centering,
+            joint_lock_weight=self._lock_w)
         task = self._build_task(xyz, quat)
         with self._fk_lock:
             return ik_core.solve(model, seed, [task], params=params,
@@ -1347,6 +1541,13 @@ class PoseCommander(Node):
             max_speed = self._max_speed
             max_accel = self._max_accel
             traj = self._traj
+            sol = self._last_solution
+            sing_decouple = self._sing_decouple
+            sing_sigma = self._sing_sigma
+            sing_exit_ratio = self._sing_exit_ratio
+            was_decoupled = self._decoupled_active
+            spd_map = dict(self._joint_speed_limits)
+            acc_map = dict(self._joint_accel_limits)
         # Goal = the controller's FULL joint set: solved values for the
         # controlled sub-group, current position (hold) for the rest. The
         # ForwardCommandController drops a command whose width != its joint
@@ -1385,10 +1586,43 @@ class PoseCommander(Node):
                 traj = SyncedJointTrajectory(ctrl_joints, seed_q,
                                              settle_rad=_FPC_SETTLE_RAD)
             dt = 1.0 / rate
-            data = traj.step(goal, dt, max_speed, max_accel)
+            # Singularity-gated decoupling. The solver's sigma_min (smallest
+            # Jacobian singular value at the solution) measures how close the
+            # arm is to a singularity. While it is low, run the DECOUPLED
+            # per-joint profile so the arm does not crawl and the big joints
+            # stay capped (EE tracking relaxed). Hysteresis (engage < sigma;
+            # disengage > sigma*ratio) avoids chattering at the threshold.
+            sigma = getattr(sol, "sigma_min", None) if sol is not None else None
+            decoupled = was_decoupled
+            if not sing_decouple:
+                decoupled = False
+            elif sing_sigma > 0.0 and sigma is not None:
+                if not decoupled and float(sigma) < sing_sigma:
+                    decoupled = True
+                elif decoupled and float(sigma) > sing_sigma * sing_exit_ratio:
+                    decoupled = False
+            if decoupled:
+                # Per-joint caps; unlisted joints fall back to the scalar limit.
+                smap = {j: spd_map.get(j, max_speed) for j in ctrl_joints}
+                amap = {j: acc_map.get(j, max_accel) for j in ctrl_joints}
+                data = traj.step_independent(goal, dt, smap, amap)
+            else:
+                if was_decoupled:
+                    # Leaving the singular region: reseed the shared lead speed
+                    # from the per-joint speeds so the handoff is jerk-bounded.
+                    traj.resync_lead()
+                data = traj.step(goal, dt, max_speed, max_accel)
+            if decoupled != was_decoupled:
+                # Log only the (rare, hysteresis-gated) transition so the live
+                # sigma_min is visible for tuning singularity_sigma.
+                self.get_logger().info(
+                    "singularity decouple %s (sigma_min=%.4f, engage<%.4f)"
+                    % ("ENGAGED" if decoupled else "released",
+                       float(sigma) if sigma is not None else -1.0, sing_sigma))
             with self._lock:
                 self._traj = traj
                 self._last_fpc_cmd = data
+                self._decoupled_active = decoupled
         else:
             # Event-driven (rate=0): publish the solved setpoint directly, with
             # optional reach_gain approach scaling (gradual stretch per cycle).
@@ -1463,6 +1697,7 @@ class PoseCommander(Node):
             self._last_fpc_cmd = None
             self._last_jtc_cmd = None
             self._traj = None
+            self._decoupled_active = False
             self._cached_goal = None
             self._cached_target_xyz = None
             self._cached_target_quat = None
@@ -1479,6 +1714,7 @@ class PoseCommander(Node):
             self._enabled = False
             self._last_target = None
             self._traj = None
+            self._decoupled_active = False
             self._cached_goal = None
             self._cached_target_xyz = None
             self._cached_target_quat = None
@@ -1639,13 +1875,17 @@ class PoseCommander(Node):
     def _set_msg(self, msg: str) -> None:
         with self._lock:
             self._last_msg = msg
-        # Dedupe + heartbeat-throttle: only log when the text changes or after a
-        # quiet interval, so a 50 Hz target stream doesn't spam the console.
+        # Per-message heartbeat throttle: emit a given text at most once per 5 s.
+        # Keying by text (not just the LAST message) means two interleaved
+        # high-rate streams with different "ignored" messages can't defeat each
+        # other's dedupe and flood the console (see __init__).
         now = time.monotonic()
-        if msg == self._last_logged_msg and (now - self._last_log_time) < 5.0:
+        if (now - self._log_times.get(msg, 0.0)) < 5.0:
             return
-        self._last_logged_msg = msg
-        self._last_log_time = now
+        self._log_times[msg] = now
+        if len(self._log_times) > 64:
+            # bound memory if many distinct messages occur over time
+            del self._log_times[min(self._log_times, key=self._log_times.get)]
         self.get_logger().info("[commander] %s" % msg)
 
     def _publish_status(self) -> None:
@@ -1676,12 +1916,18 @@ class PoseCommander(Node):
             allow_unreachable = self._allow_unreachable
             reach_gain = self._reach_gain
             best_effort = self._last_best_effort
+            last_target = self._last_target
         status = {
             "enabled": enabled,
             "configured": configured,
             "mode": mode,
             "controlled_frame": frame,
             "base_frame": self._base_frame or "(model root)",
+            # Concrete reference frame an empty-frame_id target resolves to, so
+            # the SpaceMouse bridge can anchor + stamp target_pose in the SAME
+            # frame the dashboard base-link selection chose (mirrors how tip
+            # follows controlled_frame).
+            "base_frame_resolved": self._base_frame or self._model_root(),
             "joints": joints,
             "fixed_joints": fixed_joints,
             "group_joints": group_joints,
@@ -1700,6 +1946,7 @@ class PoseCommander(Node):
             "joint_states_stale_after": self._js_stale,
             "default_stiffness": list(self._stiffness),
             "joint_centering_weight": self._centering,
+            "joint_lock_weight": self._lock_w,
             "damping": self._damping,
             "tol_pos": self._tol_pos,
             "tol_ori": self._tol_ori,
@@ -1708,8 +1955,25 @@ class PoseCommander(Node):
             "allow_unreachable": allow_unreachable,
             "reach_gain": reach_gain,
             "best_effort": best_effort,
+            "singularity_decouple": self._sing_decouple,
+            "singularity_sigma": self._sing_sigma,
+            "singularity_exit_ratio": self._sing_exit_ratio,
+            "joint_speed_limits": dict(self._joint_speed_limits),
+            "joint_accel_limits": dict(self._joint_accel_limits),
+            "decoupled_active": self._decoupled_active,
             "commands_robot": True,
         }
+        # The internal goal pose (controlled frame, model-root frame) so the
+        # dashboard can show the snapped / delta-driven target even when nothing
+        # is publishing on ~/target_pose.
+        if last_target is not None:
+            lt_xyz, lt_quat = last_target
+            status["target_pose"] = {
+                "xyz": [float(v) for v in lt_xyz],
+                "quat": [float(v) for v in lt_quat],
+            }
+        else:
+            status["target_pose"] = None
         if model is not None:
             # URDF introspection so the dashboard can offer link/joint choices
             # entirely from the live robot (no offline config).
@@ -1719,6 +1983,7 @@ class PoseCommander(Node):
             status["last_solve"] = {
                 "reachable": bool(sol.reachable),
                 "reason": sol.reason.value,
+                "sigma_min": float(getattr(sol, "sigma_min", 0.0)),
                 "max_pos_err": sol.max_pos_err(),
                 "max_ori_err": sol.max_ori_err(),
             }

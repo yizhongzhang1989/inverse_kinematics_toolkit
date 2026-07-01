@@ -151,6 +151,124 @@ def test_reset_reseeds():
     gen.reset({j: 1.0 for j in JOINTS})
     assert all(abs(gen.stream[j] - 1.0) < 1e-12 for j in JOINTS)
     assert gen.lead_vel == 0.0
+    assert all(gen.vel[j] == 0.0 for j in JOINTS)
+
+
+# --------------------------------------------------------------------------- #
+# Decoupled per-joint profile (step_independent): used near singularities to
+# cap each joint's speed (especially the big ones) instead of synchronizing the
+# whole arm to one shared profile. EE tracking is intentionally relaxed.
+# --------------------------------------------------------------------------- #
+
+def _run_indep(gen, goal, smap, amap, max_ticks=6000):
+    traj = [[gen.stream[j] for j in gen.joints]]
+    for _ in range(max_ticks):
+        data = gen.step_independent(goal, DT, smap, amap)
+        traj.append(list(data))
+        if max(abs(data[i] - goal[j])
+               for i, j in enumerate(gen.joints)) <= SETTLE:
+            break
+    return traj
+
+
+def test_independent_reaches_goal_exactly():
+    gen = SyncedJointTrajectory(JOINTS, {j: 0.0 for j in JOINTS})
+    smap = {j: VMAX for j in JOINTS}
+    amap = {j: AMAX for j in JOINTS}
+    goal = {"j1": 1.0, "j2": -0.4, "j3": 0.25}
+    traj = _run_indep(gen, goal, smap, amap)
+    final = traj[-1]
+    for i, j in enumerate(JOINTS):
+        assert abs(final[i] - goal[j]) <= SETTLE
+
+
+def test_independent_per_joint_limits_respected():
+    """Each joint stays within its OWN speed/accel cap (not a shared one)."""
+    gen = SyncedJointTrajectory(JOINTS, {j: 0.0 for j in JOINTS})
+    smap = {"j1": 0.2, "j2": 0.5, "j3": 0.8}     # big joint j1 capped low
+    amap = {"j1": 1.0, "j2": 3.0, "j3": 5.0}
+    goal = {"j1": 1.5, "j2": -1.0, "j3": 1.2}
+    traj = _run_indep(gen, goal, smap, amap)
+    prev_v = {j: 0.0 for j in JOINTS}
+    for a in range(1, len(traj)):
+        for i, j in enumerate(JOINTS):
+            v = (traj[a][i] - traj[a - 1][i]) / DT
+            # Speed cap holds at every tick.
+            assert abs(v) <= smap[j] + 1e-6
+            # Accel cap governs the MOVING phase. The final sub-settle parking
+            # tick (joint lands exactly on the goal) is a discrete-landing
+            # artifact shared by the synchronized step(); skip it.
+            parked = abs(traj[a][i] - goal[j]) <= SETTLE
+            if not parked:
+                acc = (v - prev_v[j]) / DT
+                assert abs(acc) <= amap[j] + 1e-6
+            prev_v[j] = v
+
+
+def test_independent_decouples_arrival():
+    """Opposite of the synced case: small-travel joints arrive well BEFORE a
+    large-travel joint (each runs its own profile -> no crawl to the lead)."""
+    gen = SyncedJointTrajectory(JOINTS, {j: 0.0 for j in JOINTS})
+    smap = {j: VMAX for j in JOINTS}
+    amap = {j: AMAX for j in JOINTS}
+    goal = {"j1": 2.0, "j2": 0.05, "j3": 0.05}   # j1 huge, j2/j3 tiny
+    traj = _run_indep(gen, goal, smap, amap)
+    arrive = {}
+    for k, row in enumerate(traj):
+        for i, j in enumerate(JOINTS):
+            if j not in arrive and abs(row[i] - goal[j]) <= SETTLE:
+                arrive[j] = k
+    assert arrive["j2"] < arrive["j1"]
+    assert arrive["j3"] < arrive["j1"]
+    assert arrive["j1"] - max(arrive["j2"], arrive["j3"]) > 5
+
+
+def test_independent_lower_cap_is_slower():
+    """A lower per-joint speed cap takes more ticks over the same distance."""
+    slow = SyncedJointTrajectory(["j"], {"j": 0.0})
+    fast = SyncedJointTrajectory(["j"], {"j": 0.0})
+    goal = {"j": 1.0}
+    t_slow = _run_indep(slow, goal, {"j": 0.2}, {"j": AMAX})
+    t_fast = _run_indep(fast, goal, {"j": 0.8}, {"j": AMAX})
+    assert len(t_slow) > len(t_fast)
+
+
+def test_independent_no_overshoot():
+    gen = SyncedJointTrajectory(JOINTS, {j: 0.0 for j in JOINTS})
+    smap = {j: VMAX for j in JOINTS}
+    amap = {j: AMAX for j in JOINTS}
+    goal = {"j1": 1.0, "j2": 0.5, "j3": -0.8}
+    traj = _run_indep(gen, goal, smap, amap)
+    for row in traj:
+        for i, j in enumerate(JOINTS):
+            if goal[j] >= 0:
+                assert row[i] <= goal[j] + 1e-6
+            else:
+                assert row[i] >= goal[j] - 1e-6
+
+
+def test_resync_lead_from_joint_speeds():
+    gen = SyncedJointTrajectory(JOINTS, {j: 0.0 for j in JOINTS})
+    gen.vel = {"j1": 0.1, "j2": -0.3, "j3": 0.05}
+    gen.resync_lead()
+    assert abs(gen.lead_vel - 0.3) < 1e-12
+
+
+def test_sync_to_independent_velocity_continuity():
+    """Handing off sync -> decoupled is jerk-bounded: the first decoupled step's
+    acceleration from the synced realized velocity stays within max_accel."""
+    gen = SyncedJointTrajectory(JOINTS, {j: 0.0 for j in JOINTS})
+    goal = {"j1": 2.0, "j2": 1.0, "j3": -1.5}
+    last = [gen.stream[j] for j in JOINTS]
+    for _ in range(40):                      # build up synchronized velocity
+        last = gen.step(goal, DT, VMAX, AMAX)
+    v_before = {j: gen.vel[j] for j in JOINTS}
+    data = gen.step_independent(goal, DT, {j: VMAX for j in JOINTS},
+                                {j: AMAX for j in JOINTS})
+    for i, j in enumerate(JOINTS):
+        v_after = (data[i] - last[i]) / DT
+        acc = (v_after - v_before[j]) / DT
+        assert abs(acc) <= AMAX + 1e-6
 
 
 if __name__ == "__main__":

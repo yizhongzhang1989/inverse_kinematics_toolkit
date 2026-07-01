@@ -47,3 +47,17 @@
     max_step_rad: 0.8              # reject a solve that jumps any joint > this
     joint_states_stale_after: 0.5   # s     — don't command on stale state
     status_rate_hz: 10.0
+
+    # ---- singularity handling (FPC control loop) -----------------------
+    # Near a singular configuration the synchronized FPC stream slaves every
+    # joint to one profile and the arm crawls. Decouple into per-joint profiles
+    # there (gated on the solver's sigma_min) so each joint slews at its own cap
+    # — the big proximal joints stay bounded and straight-line end-effector
+    # tracking is relaxed THROUGH the singular region.
+    singularity_decouple: true      # engage per-joint decoupling near singularity
+    singularity_sigma: 0.04         # sigma_min below which decoupling engages
+    singularity_exit_ratio: 2.0     # disengage above sigma*ratio (hysteresis)
+    # Per-joint caps for the decoupled mode (rad/s, rad/s^2) as a JSON object
+    # string; unlisted joints use the scalars above. "" = scalar for all.
+    joint_speed_limits: ""
+    joint_accel_limits: ""

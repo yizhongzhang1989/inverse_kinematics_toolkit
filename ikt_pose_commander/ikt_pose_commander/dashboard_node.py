@@ -16,7 +16,7 @@ forward kinematics for rendering (same approach as the ikt_inverse_kinematics
 dashboard; this is the shared FK library, not commander internals), and it
 watches the same ``<ns>/target_pose`` topic it publishes to, so the marker
 tracks whatever source is driving the commander (its own jog/send OR the
-``spacemouse_servo`` bridge).
+SpaceMouse ``pose_node``).
 
 It also keeps its own TF listener so it can *capture* the controlled frame's
 current pose and *jog* it (capture → offset one axis → publish). The commander
@@ -51,8 +51,8 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy, qos_profile_sensor_data)
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_msgs.msg import Bool, String
+from std_srvs.srv import SetBool, Trigger
 
 try:
     import tf2_ros
@@ -194,6 +194,9 @@ class CommanderDashboard(Node):
         self.declare_parameter("status_stale_after", 2.0)
         self.declare_parameter("robot_description_topic", "/robot_description")
         self.declare_parameter("joint_states_topic", "/joint_states")
+        # Rate at which the dashboard republishes its latest target so it ALWAYS
+        # streams target_pose (like the SpaceMouse bridge), not only on change.
+        self.declare_parameter("stream_rate_hz", 100.0)
 
         self._port = int(self.get_parameter("port").value)
         self._ns = str(self.get_parameter("commander_ns").value).rstrip("/")
@@ -201,6 +204,7 @@ class CommanderDashboard(Node):
         self._stale = float(self.get_parameter("status_stale_after").value)
         self._desc_topic = str(self.get_parameter("robot_description_topic").value)
         self._js_topic = str(self.get_parameter("joint_states_topic").value)
+        self._stream_rate = float(self.get_parameter("stream_rate_hz").value)
         self._host = "0.0.0.0"
 
         self._cbg = ReentrantCallbackGroup()
@@ -216,9 +220,14 @@ class CommanderDashboard(Node):
         self._joint_tree: List[dict] = []
         self._joint_pos: Dict[str, float] = {}
         self._pkg_dirs: Dict[str, Optional[str]] = {}
-        # live commanded target (from <ns>/target_pose, incl. spacemouse_servo)
+        # live commanded target (from <ns>/target_pose or status; incl. pose_node)
         self._target: Optional[dict] = None
         self._target_stamp = 0.0
+        # Continuous target stream: republish the latest dashboard target at
+        # stream_rate_hz so it ALWAYS sends (mirrors the SpaceMouse bridge), not
+        # only on gizmo change. Active from a stream send until a disable.
+        self._stream_pose: Optional[Tuple[list, list, str]] = None
+        self._stream_active = False
 
         self.create_subscription(String, f"{self._ns}/status", self._on_status,
                                  10, callback_group=self._cbg)
@@ -228,7 +237,7 @@ class CommanderDashboard(Node):
                                  qos_profile_sensor_data, callback_group=self._cbg)
         # Watch the same target topic we publish to, so the canvas shows the
         # live target regardless of who sent it (this dashboard's jog/send OR
-        # the spacemouse_servo teleop bridge).
+        # the SpaceMouse pose_node).
         self.create_subscription(PoseStamped, f"{self._ns}/target_pose",
                                  self._on_target, 10, callback_group=self._cbg)
         self._target_pub = self.create_publisher(
@@ -245,6 +254,27 @@ class CommanderDashboard(Node):
             Trigger, f"{self._ns}/disable", callback_group=self._cbg)
         self._cli_return = self.create_client(
             Trigger, f"{self._ns}/return_to_start", callback_group=self._cbg)
+        self._cli_snap = self.create_client(
+            Trigger, f"{self._ns}/snap_target", callback_group=self._cbg)
+        # Optional teleop bridge reanchor (set_pose -> EE) so Snap recenters the
+        # source too; harmless if no bridge is running.
+        self._cli_reanchor = self.create_client(
+            Trigger, "/spacemouse_teleop/reanchor", callback_group=self._cbg)
+        # SpaceMouse forwarding gate: toggle whether the teleop bridge streams
+        # the puck pose to target_pose, so control can be handed between the
+        # SpaceMouse and this dashboard. The bridge latches ``forwarding``.
+        self._sm_forwarding: Optional[bool] = None
+        self._cli_set_forwarding = self.create_client(
+            SetBool, "/spacemouse_teleop/set_forwarding",
+            callback_group=self._cbg)
+        self.create_subscription(
+            Bool, "/spacemouse_teleop/forwarding", self._on_sm_forwarding,
+            _latched_qos(), callback_group=self._cbg)
+        # Continuous target streamer (always-send, like the bridge): the
+        # _stream_tick timer republishes the latest target at stream_rate_hz.
+        _srate = max(1.0, self._stream_rate)
+        self.create_timer(1.0 / _srate, self._stream_tick,
+                          callback_group=self._cbg)
 
         if _HAVE_TF:
             self._tf_buffer = tf2_ros.Buffer()
@@ -270,6 +300,15 @@ class CommanderDashboard(Node):
         with self._lock:
             self._status = s
             self._status_stamp = time.monotonic()
+
+    def _on_sm_forwarding(self, msg: Bool) -> None:
+        with self._lock:
+            fwd = bool(msg.data)
+            if fwd and not self._sm_forwarding:
+                # SpaceMouse just took over -> stop our own target stream so the
+                # two sources never both drive target_pose (double rate/conflict).
+                self._stream_active = False
+            self._sm_forwarding = fwd
 
     def _on_urdf(self, msg: String) -> None:
         if not msg.data or RobotModel is None:
@@ -358,7 +397,7 @@ class CommanderDashboard(Node):
         """Live commanded target, expressed in the render (base) frame.
 
         Transforms from the message's ``frame_id`` to ``base_frame`` via TF when
-        they differ (the common spacemouse_servo case already publishes in the
+        they differ (the common SpaceMouse pose_node case already publishes in the
         base frame, so this is usually identity).
         """
         with self._lock:
@@ -390,6 +429,44 @@ class CommanderDashboard(Node):
                 "age": round(age, 2), "fresh": age <= self._stale,
                 "transformed_from": transformed_from}
 
+    def _target_from_status(self) -> Optional[dict]:
+        """The commander's internal goal pose (from ``~/status``), in the render
+        frame. Used as a fallback for the 3D marker when nothing is publishing on
+        ``~/target_pose`` (e.g. after a snap, or before the bridge sends its
+        first target). The internal target is already in the model root frame
+        (== base_frame here)."""
+        with self._lock:
+            s = self._status
+            stamp = self._status_stamp
+        if not s:
+            return None
+        tp = s.get("target_pose")
+        if not isinstance(tp, dict):
+            return None
+        xyz, quat = tp.get("xyz"), tp.get("quat")
+        if not (isinstance(xyz, list) and len(xyz) == 3
+                and isinstance(quat, list) and len(quat) == 4):
+            return None
+        age = time.monotonic() - stamp if stamp else None
+        return {"xyz": [float(v) for v in xyz],
+                "quat": [float(v) for v in quat],
+                "frame_id": self._base_frame,
+                "age": round(age, 2) if age is not None else None,
+                "fresh": age is not None and age <= self._stale,
+                "transformed_from": None, "source": "status"}
+
+    def _best_target(self) -> Optional[dict]:
+        """Live commanded target for the 3D marker: prefer a FRESH absolute
+        target on ``~/target_pose`` (gizmo / spacemouse-absolute), else fall back
+        to the commander's internal goal pose from ``~/status`` (snap / delta)."""
+        topic_t = self._target_in_base()
+        if topic_t is not None and topic_t.get("fresh"):
+            return topic_t
+        status_t = self._target_from_status()
+        if status_t is not None:
+            return status_t
+        return topic_t
+
     def snapshot(self) -> dict:
         with self._lock:
             s = self._status
@@ -402,7 +479,12 @@ class CommanderDashboard(Node):
         out = {"status": s, "fresh": fresh,
                "age": round(age, 2) if age is not None else None,
                "commander_ns": self._ns, "base_frame": self._base_frame,
-               "target": self._target_in_base(), "has_model_viz": model is not None}
+               "target": self._best_target(), "has_model_viz": model is not None}
+        with self._lock:
+            fwd = self._sm_forwarding
+        out["spacemouse"] = {
+            "bridge": self._cli_set_forwarding.service_is_ready(),
+            "forwarding": fwd}
         if model is not None:
             q = self._full_q(model)
             with self._fk_lock:
@@ -473,6 +555,9 @@ class CommanderDashboard(Node):
 
     def call_trigger(self, enable: bool, timeout: float = 5.0) -> dict:
         cli = self._cli_enable if enable else self._cli_disable
+        if not enable:
+            with self._lock:
+                self._stream_active = False   # stop the dashboard target stream
         if not cli.wait_for_service(timeout_sec=timeout):
             return {"ok": False, "message": "service unavailable "
                     "(is the commander running?)"}
@@ -495,6 +580,56 @@ class CommanderDashboard(Node):
             return {"ok": False, "message": "return_to_start timed out"}
         res = fut.result()
         return {"ok": bool(res.success), "message": res.message}
+
+    def call_snap_target(self, timeout: float = 5.0) -> dict:
+        """Call the commander's ``~/snap_target`` service.
+
+        Snaps the commander's internal target onto the controlled frame's
+        CURRENT pose (forward kinematics of the measured joints) -- the
+        server-side counterpart of the 3D "Snap target -> link" button, used to
+        seed the goal before delta jogging or to re-centre with no jump.
+        """
+        if not self._cli_snap.wait_for_service(timeout_sec=timeout):
+            return {"ok": False, "message": "snap_target unavailable "
+                    "(is the commander running + configured?)"}
+        fut = self._cli_snap.call_async(Trigger.Request())
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "snap_target timed out"}
+        res = fut.result()
+        return {"ok": bool(res.success), "message": res.message}
+
+    def call_reanchor(self, timeout: float = 2.0) -> dict:
+        """Reset the teleop source to the current EE (bridge ~/reanchor ->
+        set_pose) so a Snap also recenters the puck and the goal stays put.
+        No-op if no bridge is running."""
+        if not self._cli_reanchor.wait_for_service(timeout_sec=timeout):
+            return {"ok": False, "message": "no teleop bridge"}
+        fut = self._cli_reanchor.call_async(Trigger.Request())
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "reanchor timed out"}
+        r = fut.result()
+        return {"ok": bool(r.success), "message": r.message}
+
+    def call_set_forwarding(self, enable: bool, timeout: float = 2.0) -> dict:
+        """Toggle the teleop bridge's forwarding (~/set_forwarding, SetBool).
+
+        ON  = SpaceMouse drives target_pose; OFF = this dashboard does. Returns
+        a no-op message if no bridge is running."""
+        if not self._cli_set_forwarding.wait_for_service(timeout_sec=timeout):
+            return {"ok": False, "message": "no teleop bridge"}
+        req = SetBool.Request()
+        req.data = bool(enable)
+        fut = self._cli_set_forwarding.call_async(req)
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout=timeout):
+            return {"ok": False, "message": "set_forwarding timed out"}
+        r = fut.result()
+        return {"ok": bool(r.success), "message": r.message}
 
     def capture(self, timeout: float = 2.0
                 ) -> Tuple[Optional[list], Optional[list]]:
@@ -533,22 +668,43 @@ class CommanderDashboard(Node):
         m = self._build_target_msg(xyz, quat, frame_id)
         # publish a few times so a just-matched subscriber surely receives it
         for _ in range(3):
-            self._target_pub.publish(m)
+            self._target_pub.publish(m)                  # target pose -> commander
             time.sleep(0.02)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}
 
     def stream_pose(self, xyz: list, quat: list, frame_id: str) -> dict:
-        """Publish ONE target setpoint (fast path for live gizmo dragging).
+        """Publish a target setpoint AND keep streaming it.
 
-        Unlike ``send_pose`` (which repeats for delivery reliability on a
-        one-shot send), this publishes a single message with no sleep so it can
-        be called at the gizmo drag rate; the next frame re-sends anyway.
+        Publishes immediately, then stores it as the active stream target so the
+        ``_stream_tick`` timer keeps republishing at ``stream_rate_hz`` -- the
+        dashboard then ALWAYS sends target_pose (like the SpaceMouse bridge),
+        not only when the gizmo moves. Streaming stops on disable.
         """
         m = self._build_target_msg(xyz, quat, frame_id)
-        self._target_pub.publish(m)
+        with self._lock:
+            # While the SpaceMouse bridge is forwarding it OWNS target_pose, so
+            # ignore the dashboard target entirely (don't arm the stream) -- the
+            # two sources never both drive, and nothing stale resumes later.
+            active = not self._sm_forwarding
+            if active:
+                self._stream_pose = (list(xyz), list(quat), frame_id)
+                self._stream_active = True
+        if active:
+            self._target_pub.publish(m)
         return {"ok": True, "xyz": [m.pose.position.x, m.pose.position.y,
                                     m.pose.position.z], "frame_id": m.header.frame_id}
+
+    def _stream_tick(self) -> None:
+        with self._lock:
+            # Suppress while the SpaceMouse bridge is forwarding so the two
+            # sources never both publish target_pose (double rate + conflict).
+            active = self._stream_active and not self._sm_forwarding
+            sp = self._stream_pose
+        if not (active and sp):
+            return
+        xyz, quat, frame_id = sp
+        self._target_pub.publish(self._build_target_msg(xyz, quat, frame_id))
 
     def jog(self, axis: str, delta: float) -> dict:
         xyz, quat = self.capture()
@@ -598,12 +754,20 @@ class CommanderDashboard(Node):
                     return self._send(200, json.dumps(dash.snapshot()))
                 if path == "/mesh":
                     q = parse_qs(urlparse(self.path).query)
-                    data = dash.read_mesh((q.get("pkg") or [""])[0],
-                                          (q.get("path") or [""])[0])
+                    rel = (q.get("path") or [""])[0]
+                    data = dash.read_mesh((q.get("pkg") or [""])[0], rel)
                     if data is None:
                         return self._send(404, b'{"error":"mesh not found"}')
+                    low = rel.lower()
+                    if low.endswith(".dae"):
+                        ctype = "model/vnd.collada+xml"
+                    elif low.endswith(".stl"):
+                        ctype = "model/stl"
+                    else:
+                        ctype = (mimetypes.guess_type(low)[0]
+                                 or "application/octet-stream")
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Cache-Control", "public, max-age=86400")
                     self.send_header("Access-Control-Allow-Origin", "*")
@@ -629,6 +793,15 @@ class CommanderDashboard(Node):
                 if path == "/api/return_to_start":
                     return self._send(200, json.dumps(
                         dash.call_return_to_start()))
+                if path == "/api/snap_target":
+                    return self._send(200, json.dumps(
+                        dash.call_snap_target()))
+                if path == "/api/reanchor":
+                    return self._send(200, json.dumps(dash.call_reanchor()))
+                if path == "/api/spacemouse_forwarding":
+                    body = self._read_json()
+                    return self._send(200, json.dumps(
+                        dash.call_set_forwarding(bool(body.get("enabled")))))
                 if path == "/api/capture":
                     xyz, quat = dash.capture()
                     if xyz is None:
